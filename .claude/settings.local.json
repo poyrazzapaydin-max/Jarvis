@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "WebFetch(domain:registry.npmjs.org)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:www.jblanked.com)",
+      "WebFetch(domain:site.financialmodelingprep.com)",
+      "WebFetch(domain:financialmodelingprep.com)",
+      "WebFetch(domain:coinmarketcal.com)",
+      "WebFetch(domain:finnhub.io)",
+      "WebFetch(domain:cryptopanic.com)",
+      "WebFetch(domain:min-api.cryptocompare.com)",
+      "WebFetch(domain:www.federalreserve.gov)",
+      "WebFetch(domain:www.ecb.europa.eu)",
+      "WebFetch(domain:www.bls.gov)"
+    ]
+  }
+}

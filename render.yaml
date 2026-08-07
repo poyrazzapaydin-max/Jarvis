@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: jarvis-app
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3-flash-preview
+      - key: MEXC_API_KEY
+        sync: false
+      - key: MEXC_API_SECRET
+        sync: false
