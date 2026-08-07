@@ -2583,6 +2583,12 @@
   .perf-bar-row .value.down, .compare-bar-row .value.down { color: var(--red); }
 
   /* ---- Letzte Trades ---- */
+  .trades-range-info {
+    font-size: 0.66rem;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+  }
+
   .trade-list {
     display: flex;
     flex-direction: column;
@@ -3347,6 +3353,7 @@
 
           <div class="panel-card">
             <div class="panel-title">LETZTE 30 TRADES <span class="card-title-hint">— MEXC Futures</span></div>
+            <div class="trades-range-info mono" id="tradesRangeInfo"></div>
             <div class="trade-list" id="lastTradesList">
               <div class="notes-empty">Noch keine Trade-Historie geladen.</div>
             </div>
@@ -4172,6 +4179,7 @@
   const RECON_LAST_RUN_KEY = 'jarvis_equity_recon_last_run';
   const RECON_EARLIEST_KEY = 'jarvis_equity_recon_earliest_date';
   const LAST_TRADES_KEY = 'jarvis_last_trades';
+  const TRADES_OLDEST_KEY = 'jarvis_trades_oldest_seen';
 
   function tradeRowHtml(p) {
     const symbol = (p.symbol || '—').replace('_', '/');
@@ -4206,22 +4214,79 @@
 
   function renderLastTrades() {
     const el = document.getElementById('lastTradesList');
+    const rangeEl = document.getElementById('tradesRangeInfo');
     if (!el) return;
     const trades = JSON.parse(localStorage.getItem(LAST_TRADES_KEY) || '[]');
     el.innerHTML = trades.length
       ? trades.map(tradeRowHtml).join('')
       : '<div class="notes-empty">Noch keine Trade-Historie geladen.</div>';
+
+    if (rangeEl) {
+      const oldestTs = Number(localStorage.getItem(TRADES_OLDEST_KEY) || 0);
+      if (oldestTs) {
+        const oldestDate = new Date(oldestTs).toLocaleDateString('de-DE');
+        rangeEl.textContent = `${trades.length} von zuletzt geladen · Historie reicht zurück bis ${oldestDate}`;
+      } else {
+        rangeEl.textContent = '';
+      }
+    }
   }
 
   async function mexcPaginateAll(path, extraParams = {}, maxPages = 15) {
     let all = [];
     for (let page = 1; page <= maxPages; page++) {
-      const body = await mexcFuturesSignedGet(path, { ...extraParams, page_num: page, page_size: 100 });
+      let body;
+      try {
+        body = await mexcFuturesSignedGet(path, { ...extraParams, page_num: page, page_size: 100 });
+      } catch (err) {
+        // Lieber das bisher Gesammelte zurückgeben, als bei einem einzelnen
+        // fehlgeschlagenen Seitenaufruf (z.B. kurzes Rate-Limit) alles zu verwerfen.
+        console.error(`Pagination-Fehler auf Seite ${page} (${path}):`, err);
+        break;
+      }
       const data = body.data || [];
       all = all.concat(data);
       if (data.length < 100) break;
     }
     return all;
+  }
+
+  // Letzte 30 abgeschlossenen Trades - unabhängig von der einmal-täglichen
+  // Verlaufsrekonstruktion, damit die Liste sofort beim Laden die
+  // tatsächlich vorhandene MEXC-Historie zeigt statt erst "ab jetzt" zu füllen.
+  function updateLastTradesFromPositions(positions) {
+    const withCloseTime = positions.filter(p => p.closeTime);
+    const lastTrades = withCloseTime
+      .slice()
+      .sort((a, b) => Number(b.closeTime) - Number(a.closeTime))
+      .slice(0, 30);
+    localStorage.setItem(LAST_TRADES_KEY, JSON.stringify(lastTrades));
+
+    if (withCloseTime.length) {
+      const oldest = withCloseTime.reduce((min, p) => {
+        const t = Number(p.closeTime);
+        return (min === null || t < min) ? t : min;
+      }, null);
+      if (oldest) localStorage.setItem(TRADES_OLDEST_KEY, String(oldest));
+    }
+    renderLastTrades();
+  }
+
+  let lastTradesFetchRunning = false;
+
+  async function refreshLastTrades() {
+    await serverStatusReady;
+    if (!isMexcConfigured() || lastTradesFetchRunning) return;
+    lastTradesFetchRunning = true;
+    try {
+      const positions = await mexcPaginateAll('/api/v1/private/position/list/history_positions');
+      updateLastTradesFromPositions(positions);
+      addFeedEntry('Trade-Historie aktualisiert (' + positions.length + ' Positionen geladen)');
+    } catch (err) {
+      console.error('Trade-Historie konnte nicht geladen werden:', err);
+    } finally {
+      lastTradesFetchRunning = false;
+    }
   }
 
   function buildReconstructedHistory(positions, fundingRecords, currentTotalUsd) {
@@ -4280,13 +4345,7 @@
       }
       redrawPortfolioCharts();
 
-      // Letzte 30 abgeschlossenen Trades (aus denselben Positionsdaten, kein Zusatz-Request nötig)
-      const lastTrades = positions
-        .filter(p => p.closeTime)
-        .sort((a, b) => Number(b.closeTime) - Number(a.closeTime))
-        .slice(0, 30);
-      localStorage.setItem(LAST_TRADES_KEY, JSON.stringify(lastTrades));
-      renderLastTrades();
+      updateLastTradesFromPositions(positions);
     } catch (err) {
       console.error('Verlaufs-Rekonstruktion fehlgeschlagen:', err);
     }
@@ -4634,6 +4693,9 @@
 
   refreshMexcPortfolio();
   setInterval(refreshMexcPortfolio, 30000);
+
+  refreshLastTrades();
+  setInterval(refreshLastTrades, 3 * 60000);
 
   // ============ Chat mit Gemini API ============
   const chatMessages = document.getElementById('chatMessages');
