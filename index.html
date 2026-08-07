@@ -4181,6 +4181,19 @@
   const LAST_TRADES_KEY = 'jarvis_last_trades';
   const TRADES_OLDEST_KEY = 'jarvis_trades_oldest_seen';
 
+  // MEXC liefert bei history_positions KEIN "closeTime"-Feld - nur
+  // createTime (Eröffnung) und updateTime (letzte Änderung = faktischer
+  // Schließzeitpunkt bei einer bereits geschlossenen Position).
+  function getPositionCloseTime(p) {
+    return Number(p.closeTime || p.updateTime || p.createTime || 0);
+  }
+
+  function isPositionClosed(p) {
+    // state 3 = geschlossen (MEXC-Konvention); zur Sicherheit zusätzlich
+    // über holdVol/closeVol prüfen, falls "state" fehlt.
+    return Number(p.state) === 3 || (Number(p.holdVol) === 0 && Number(p.closeVol) > 0);
+  }
+
   function tradeRowHtml(p) {
     const symbol = (p.symbol || '—').replace('_', '/');
     const isLong = Number(p.positionType) === 1;
@@ -4192,8 +4205,9 @@
     const priceChangePct = openPrice ? ((closePrice - openPrice) / openPrice) * 100 * (isLong ? 1 : -1) : 0;
     const pnlClass = pnl >= 0 ? 'up' : 'down';
     const pctClass = priceChangePct >= 0 ? 'up' : 'down';
-    const time = p.closeTime
-      ? new Date(Number(p.closeTime)).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
+    const closeTs = getPositionCloseTime(p);
+    const time = closeTs
+      ? new Date(closeTs).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
       : '—';
 
     return `<div class="trade-row">
@@ -4255,16 +4269,16 @@
   // Verlaufsrekonstruktion, damit die Liste sofort beim Laden die
   // tatsächlich vorhandene MEXC-Historie zeigt statt erst "ab jetzt" zu füllen.
   function updateLastTradesFromPositions(positions) {
-    const withCloseTime = positions.filter(p => p.closeTime);
-    const lastTrades = withCloseTime
+    const closed = positions.filter(p => isPositionClosed(p) && getPositionCloseTime(p));
+    const lastTrades = closed
       .slice()
-      .sort((a, b) => Number(b.closeTime) - Number(a.closeTime))
+      .sort((a, b) => getPositionCloseTime(b) - getPositionCloseTime(a))
       .slice(0, 30);
     localStorage.setItem(LAST_TRADES_KEY, JSON.stringify(lastTrades));
 
-    if (withCloseTime.length) {
-      const oldest = withCloseTime.reduce((min, p) => {
-        const t = Number(p.closeTime);
+    if (closed.length) {
+      const oldest = closed.reduce((min, p) => {
+        const t = getPositionCloseTime(p);
         return (min === null || t < min) ? t : min;
       }, null);
       if (oldest) localStorage.setItem(TRADES_OLDEST_KEY, String(oldest));
