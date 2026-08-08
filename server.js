@@ -58,6 +58,31 @@ app.get('/api/config/status', (req, res) => {
   });
 });
 
+// Schlanker, direkter Gemini-Aufruf für Server-interne Zwecke (Auto-Trader-
+// Gegencheck und Selbstauswertung). Gibt bei fehlendem Key null zurück,
+// statt zu werfen - Aufrufer müssen den Fallback selbst handhaben.
+async function callGeminiText(prompt) {
+  if (!GEMINI_API_KEY) return null;
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }] })
+    });
+    if (!upstream.ok) {
+      console.error('Auto Trader: Gemini-Aufruf fehlgeschlagen, HTTP', upstream.status);
+      return null;
+    }
+    const data = await upstream.json();
+    const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text).join('') || '';
+    return text || null;
+  } catch (err) {
+    console.error('Auto Trader: Gemini-Aufruf-Fehler:', err.message || err);
+    return null;
+  }
+}
+
 // ============================================================
 // Gemini-Proxy - der Browser schickt nur { contents, systemInstruction },
 // der Key wird hier serverseitig angehängt und nie an den Client gesendet.
@@ -279,6 +304,27 @@ async function initPaperTradingSchema() {
       balance NUMERIC NOT NULL
     );
   `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS paper_skipped_setups (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      reason TEXT,
+      criteria_trend BOOLEAN NOT NULL DEFAULT false,
+      criteria_volume BOOLEAN NOT NULL DEFAULT false,
+      criteria_mtf BOOLEAN NOT NULL DEFAULT false,
+      gemini_reasoning TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS paper_insights (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      trade_count INTEGER NOT NULL DEFAULT 0,
+      insight_text TEXT,
+      generated_at TIMESTAMPTZ
+    );
+  `);
 
   // Migration für Spalten, die nachträglich (nach dem ersten Deploy) hinzukamen -
   // "CREATE TABLE IF NOT EXISTS" ergänzt bei bereits existierenden Tabellen
@@ -290,6 +336,10 @@ async function initPaperTradingSchema() {
   await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS margin_eur NUMERIC NOT NULL DEFAULT 0');
   await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS liquidation_price NUMERIC');
   await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS liquidates_first BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS criteria_trend BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS criteria_volume BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS criteria_mtf BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gemini_reasoning TEXT');
 
   const { rows } = await pgPool.query('SELECT id FROM paper_settings WHERE id = 1');
   if (!rows.length) {
@@ -299,6 +349,10 @@ async function initPaperTradingSchema() {
       [PAPER_DEFAULT_SETTINGS.riskPerTradeEur, PAPER_DEFAULT_SETTINGS.riskRewardRatio, PAPER_DEFAULT_SETTINGS.watchedSymbols, PAPER_DEFAULT_SETTINGS.startCapitalEur, PAPER_DEFAULT_SETTINGS.leverage]
     );
     await pgPool.query('INSERT INTO paper_balance_history (balance) VALUES ($1)', [PAPER_DEFAULT_SETTINGS.startCapitalEur]);
+  }
+  const { rows: insightRows } = await pgPool.query('SELECT id FROM paper_insights WHERE id = 1');
+  if (!insightRows.length) {
+    await pgPool.query('INSERT INTO paper_insights (id, trade_count, insight_text, generated_at) VALUES (1, 0, NULL, NULL)');
   }
 }
 
@@ -335,6 +389,10 @@ function rowToTrade(row) {
     marginEur: Number(row.margin_eur),
     liquidationPrice: row.liquidation_price != null ? Number(row.liquidation_price) : null,
     liquidatesFirst: row.liquidates_first,
+    criteriaTrend: row.criteria_trend,
+    criteriaVolume: row.criteria_volume,
+    criteriaMtf: row.criteria_mtf,
+    geminiReasoning: row.gemini_reasoning,
     reason: row.reason,
     openedAt: new Date(row.opened_at).getTime(),
     exitPrice: row.exit_price != null ? Number(row.exit_price) : null,
@@ -344,11 +402,28 @@ function rowToTrade(row) {
   };
 }
 
+function rowToSkipped(row) {
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    direction: row.direction,
+    reason: row.reason,
+    criteriaTrend: row.criteria_trend,
+    criteriaVolume: row.criteria_volume,
+    criteriaMtf: row.criteria_mtf,
+    geminiReasoning: row.gemini_reasoning,
+    createdAt: new Date(row.created_at).getTime()
+  };
+}
+
 async function fetchPaperCandles(symbol, interval = '15m', limit = 200) {
   const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
   if (!res.ok) throw new Error(`Kline-Fehler für ${symbol}: HTTP ${res.status}`);
   const raw = await res.json();
-  return raw.map(k => ({ time: Number(k[0]), open: Number(k[1]), high: Number(k[2]), low: Number(k[3]), close: Number(k[4]) }));
+  return raw.map(k => ({
+    time: Number(k[0]), open: Number(k[1]), high: Number(k[2]), low: Number(k[3]), close: Number(k[4]),
+    volume: Number(k[5])
+  }));
 }
 
 // Lokale Hoch-/Tiefpunkte: eine Kerze gilt als "lokal", wenn ihr High/Low
@@ -406,6 +481,8 @@ function detectPaperSetup(candles) {
         return {
           direction: 'long',
           sweepExtreme: sweep.sweepExtreme,
+          sweepIndex: sweep.index,
+          bosIndex: bos.index,
           reason: `Liquidation Sweep unter ${sweep.sweptLevel.toFixed(4)}, danach Break of Structure über ${bos.brokenLevel.toFixed(4)} (${distancePct.toFixed(2)}% Abstand zur Zone).`
         };
       }
@@ -438,6 +515,8 @@ function detectPaperSetup(candles) {
         return {
           direction: 'short',
           sweepExtreme: sweep.sweepExtreme,
+          sweepIndex: sweep.index,
+          bosIndex: bos.index,
           reason: `Liquidation Sweep über ${sweep.sweptLevel.toFixed(4)}, danach Break of Structure unter ${bos.brokenLevel.toFixed(4)} (${distancePct.toFixed(2)}% Abstand zur Zone).`
         };
       }
@@ -445,6 +524,118 @@ function detectPaperSetup(candles) {
   }
 
   return null;
+}
+
+// ---- Zusatz-Bestätigungskriterien (a: Trend, b: Volumen, c: Mehrere Zeitebenen) ----
+
+// a) Trendfilter: SMA200 auf 1h-Kerzen, Fallback SMA50 falls nicht genug
+// Historie vorhanden ist (Binance liefert je nach Symbol ggf. <200 1h-Kerzen
+// bei sehr neuen Listings - für dieses simulierte Setting unkritisch).
+function checkTrendFilter(candles1h, direction) {
+  const closes = candles1h.map(c => c.close);
+  const period = closes.length >= 200 ? 200 : Math.min(50, closes.length);
+  if (period < 10) return { pass: false, period, sma: null }; // zu wenig Historie, sicherheitshalber ablehnen
+  const sma = closes.slice(-period).reduce((a, b) => a + b, 0) / period;
+  const currentPrice = closes[closes.length - 1];
+  const pass = direction === 'long' ? currentPrice > sma : currentPrice < sma;
+  return { pass, period, sma };
+}
+
+// b) Volumen-Bestätigung: Volumen der BOS-Kerze (Bestätigungskerze) muss
+// mindestens das 1,5-fache des Durchschnittsvolumens der letzten 20 Kerzen
+// davor betragen.
+function checkVolumeConfirmation(candles, confirmIndex) {
+  const start = Math.max(0, confirmIndex - 20);
+  const priorVolumes = candles.slice(start, confirmIndex).map(c => c.volume);
+  if (!priorVolumes.length) return { pass: false, avgVolume: 0, confirmVolume: 0 };
+  const avgVolume = priorVolumes.reduce((a, b) => a + b, 0) / priorVolumes.length;
+  const confirmVolume = candles[confirmIndex].volume;
+  return { pass: avgVolume > 0 && confirmVolume >= avgVolume * 1.5, avgVolume, confirmVolume };
+}
+
+// c) Mehrere Zeitebenen: auf dem übergeordneten 1h-Chart darf keine
+// unmittelbar gegenläufige starke Struktur (lokales Hoch/Tief) in der Nähe
+// (<=1%) des aktuellen Kurses liegen - sonst würde der Trade direkt in
+// eine große 1h-Resistance/Support hineinlaufen.
+function checkMultiTimeframe(candles1h, direction, currentPrice) {
+  const { highs, lows } = findLocalExtrema(candles1h, 3);
+  if (direction === 'long') {
+    const nearResistance = highs.find(h => h.price > currentPrice && (h.price - currentPrice) / currentPrice <= 0.01);
+    return { pass: !nearResistance, blockingLevel: nearResistance ? nearResistance.price : null };
+  } else {
+    const nearSupport = lows.find(l => l.price < currentPrice && (currentPrice - l.price) / currentPrice <= 0.01);
+    return { pass: !nearSupport, blockingLevel: nearSupport ? nearSupport.price : null };
+  }
+}
+
+// ---- Leichte technische Indikatoren für den Gemini-Kontext (Server-Variante,
+// da die vorhandenen SMA/RSI/MACD-Funktionen im Frontend liegen und dort
+// nicht ohne Weiteres server-seitig wiederverwendbar sind - hier bewusst
+// kompakt neu implementiert statt dupliziert einzubinden). ----
+function calcServerRsi(closes, period = 14) {
+  if (closes.length < period + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff; else losses -= diff;
+  }
+  const avgGain = gains / period, avgLoss = losses / period;
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - (100 / (1 + rs));
+}
+
+function calcServerMacd(closes) {
+  if (closes.length < 35) return null;
+  const ema = (values, period) => {
+    const k = 2 / (period + 1);
+    let prev = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    const out = [prev];
+    for (let i = period; i < values.length; i++) {
+      prev = values[i] * k + prev * (1 - k);
+      out.push(prev);
+    }
+    return out;
+  };
+  const ema12 = ema(closes, 12);
+  const ema26 = ema(closes, 26);
+  const offset = ema12.length - ema26.length;
+  const macdLine = ema26.map((v, i) => ema12[i + offset] - v);
+  const signalLine = ema(macdLine, 9);
+  const macd = macdLine[macdLine.length - 1];
+  const signal = signalLine[signalLine.length - 1];
+  return { macd, signal, histogram: macd - signal };
+}
+
+// NUR SIMULATION - fragt Gemini als Gegencheck vor Eröffnung eines Paper-
+// Trades. Löst zu keinem Zeitpunkt eine echte Order aus, ruft ausschließlich
+// die eigene Gemini-Textgenerierung auf. Bei fehlendem GEMINI_API_KEY wird
+// der Trade automatisch freigegeben (kein Gegencheck technisch möglich) -
+// das wird in der Begründung transparent vermerkt.
+async function askGeminiTradeCheck({ symbol, direction, setup, criteria, candles5m, rsi, macd }) {
+  const currentPrice = candles5m[candles5m.length - 1].close;
+  const recentPrices = candles5m.slice(-12).map(c => c.close.toFixed(4)).join(', ');
+  const prompt = `Du bist ein erfahrener, nüchterner Krypto-Trader. Bewerte folgendes automatisch erkanntes Paper-Trading-Setup (reine Simulation, kein echtes Geld):
+
+Coin: ${symbol}
+Richtung: ${direction === 'long' ? 'LONG' : 'SHORT'}
+Erkanntes Muster: ${setup.reason}
+Aktueller Kurs: ${currentPrice}
+Letzte Kurse (5-Min, älteste zuerst): ${recentPrices}
+RSI(14, 5m): ${rsi != null ? rsi.toFixed(1) : 'nicht verfügbar'}
+MACD-Histogramm(5m): ${macd ? macd.histogram.toFixed(6) : 'nicht verfügbar'}
+Zusatzkriterien bereits erfüllt: Trend ${criteria.trend.pass ? 'JA' : 'NEIN'}, Volumen ${criteria.volume.pass ? 'JA' : 'NEIN'}, Mehrere-Zeitebenen ${criteria.mtf.pass ? 'JA' : 'NEIN'}
+
+Gib eine kurze Einschätzung in 2-3 Sätzen ab, ob dieses Setup in diesem Kontext wirklich sinnvoll erscheint oder ob es Gegenargumente gibt. Schreibe zum Schluss als letztes Wort/letzte Zeile klar maschinenlesbar: "ENTSCHEIDUNG: JA" wenn der Trade eröffnet werden soll, oder "ENTSCHEIDUNG: NEIN" wenn nicht.`;
+
+  const text = await callGeminiText(prompt);
+  if (!text) {
+    return { approved: true, reasoning: 'Gemini nicht konfiguriert oder nicht erreichbar - Trade automatisch freigegeben (kein Gegencheck möglich).' };
+  }
+  const match = text.toUpperCase().match(/ENTSCHEIDUNG:\s*(JA|NEIN)/);
+  const approved = match ? match[1] === 'JA' : true; // unklare Antwort -> konservativ freigeben, aber vermerken
+  const reasoning = match ? text.trim() : `${text.trim()} [Hinweis: keine eindeutige ENTSCHEIDUNG erkannt, Trade sicherheitshalber freigegeben]`;
+  return { approved, reasoning };
 }
 
 // Hebel-Berechnung (siehe Erklärung im Chat für die Herleitung):
@@ -495,7 +686,8 @@ function computePaperTradePlan(direction, entryPrice, sweepExtreme, settings) {
 // maxOpenPositions wird als Parameter übergeben (statt erneut abgefragt),
 // da mehrere Coins pro Zyklus dieselbe Settings-Zeile teilen.
 async function checkPaperSymbol(symbol, settings) {
-  const candles = await fetchPaperCandles(symbol, '15m', 200);
+  // Haupt-Zeitrahmen jetzt 5-Minuten-Kerzen (Punkt 1c der Erweiterung, vorher 15m).
+  const candles = await fetchPaperCandles(symbol, '5m', 200);
   const lastPrice = candles[candles.length - 1].close;
   paperLastPrices[symbol] = lastPrice;
 
@@ -545,6 +737,14 @@ async function checkPaperSymbol(symbol, settings) {
       [pnlEur]
     );
     await pgPool.query('INSERT INTO paper_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+
+    // Punkt 3: nach jeweils 20 geschlossenen Trades eine Gemini-Selbstauswertung
+    // anstoßen (rein informativ, verändert die Regeln aus Punkt 1 nicht automatisch).
+    const { rows: closedCountRows } = await pgPool.query("SELECT COUNT(*)::int AS c FROM paper_trades WHERE status = 'closed'");
+    const closedCount = closedCountRows[0].c;
+    if (closedCount > 0 && closedCount % 20 === 0) {
+      generatePaperInsights(closedCount).catch(err => console.error('Auto Trader: Insight-Generierung fehlgeschlagen:', err.message || err));
+    }
   }
 
   const { rows: stillOpenForSymbol } = await pgPool.query(
@@ -559,12 +759,65 @@ async function checkPaperSymbol(symbol, settings) {
   const setup = detectPaperSetup(candles);
   if (!setup) return;
 
+  // Punkt 1: Zusatzkriterien - alle drei müssen erfüllt sein, sonst wird das
+  // Setup gar nicht erst gewertet (kein Trade, kein Log unter "Übersprungen",
+  // da es die Basis-Erkennung per Definition nicht bestanden hat).
+  const candles1h = await fetchPaperCandles(symbol, '1h', 200);
+  const trend = checkTrendFilter(candles1h, setup.direction);
+  const volume = checkVolumeConfirmation(candles, setup.bosIndex);
+  const mtf = checkMultiTimeframe(candles1h, setup.direction, lastPrice);
+  const criteria = { trend, volume, mtf };
+  if (!trend.pass || !volume.pass || !mtf.pass) return;
+
+  // Punkt 2: Gemini als Gegencheck, bevor der Trade wirklich eröffnet wird.
+  const closes5m = candles.map(c => c.close);
+  const rsi = calcServerRsi(closes5m, 14);
+  const macd = calcServerMacd(closes5m);
+  const geminiResult = await askGeminiTradeCheck({ symbol, direction: setup.direction, setup, criteria, candles5m: candles, rsi, macd });
+
   const entryPrice = lastPrice;
+
+  if (!geminiResult.approved) {
+    await pgPool.query(
+      `INSERT INTO paper_skipped_setups (id, symbol, direction, reason, criteria_trend, criteria_volume, criteria_mtf, gemini_reasoning)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [crypto.randomUUID(), symbol, setup.direction, setup.reason, trend.pass, volume.pass, mtf.pass, geminiResult.reasoning]
+    );
+    return;
+  }
+
   const plan = computePaperTradePlan(setup.direction, entryPrice, setup.sweepExtreme, settings);
+  const fullReason = `${setup.reason} Gemini-Gegencheck: ${geminiResult.reasoning}`;
   await pgPool.query(
-    `INSERT INTO paper_trades (id, symbol, direction, entry_price, stop_loss, take_profit, position_size_eur, risk_eur, leverage, margin_eur, liquidation_price, liquidates_first, reason, status, opened_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'open', now())`,
-    [crypto.randomUUID(), symbol, setup.direction, entryPrice, plan.stopLoss, plan.takeProfit, plan.positionSizeEur, settings.riskPerTradeEur, plan.leverage, plan.marginEur, plan.liquidationPrice, plan.liquidatesFirst, setup.reason]
+    `INSERT INTO paper_trades (id, symbol, direction, entry_price, stop_loss, take_profit, position_size_eur, risk_eur, leverage, margin_eur, liquidation_price, liquidates_first, criteria_trend, criteria_volume, criteria_mtf, gemini_reasoning, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, entryPrice, plan.stopLoss, plan.takeProfit, plan.positionSizeEur, settings.riskPerTradeEur, plan.leverage, plan.marginEur, plan.liquidationPrice, plan.liquidatesFirst, trend.pass, volume.pass, mtf.pass, geminiResult.reasoning, fullReason]
+  );
+}
+
+// Punkt 3: NUR informative Selbstauswertung - verändert nie automatisch die
+// Regeln aus Punkt 1, sondern liefert dem Nutzer Text zur manuellen Auswertung.
+async function generatePaperInsights(closedCount) {
+  const { rows } = await pgPool.query(
+    "SELECT symbol, direction, pnl_eur, criteria_trend, criteria_volume, criteria_mtf, closed_at FROM paper_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 100"
+  );
+  const summaryLines = rows.map(r => {
+    const hour = new Date(r.closed_at).getUTCHours();
+    const result = Number(r.pnl_eur) >= 0 ? 'GEWINN' : 'VERLUST';
+    return `${r.symbol} ${r.direction} | Trend:${r.criteria_trend ? 'J' : 'N'} Volumen:${r.criteria_volume ? 'J' : 'N'} MTF:${r.criteria_mtf ? 'J' : 'N'} | Stunde:${hour} | ${result}`;
+  }).join('\n');
+
+  const prompt = `Du analysierst die Historie eines simulierten Krypto-Paper-Trading-Bots (kein echtes Geld). Hier die letzten ${rows.length} geschlossenen Trades (Coin, Richtung, ob die Zusatzkriterien Trend/Volumen/Mehrere-Zeitebenen erfüllt waren, Schlussstunde UTC, Ergebnis):
+
+${summaryLines}
+
+Erkenne Muster, z.B. ob bestimmte Kriterien-Kombinationen, Coins oder Tageszeiten auffällig besser oder schlechter abschneiden. Fasse deine Erkenntnisse in 3-5 kurzen, konkreten Sätzen zusammen (auf Deutsch). Keine Handlungsempfehlung, nur Beobachtungen.`;
+
+  const text = await callGeminiText(prompt);
+  const insightText = text || 'Gemini nicht konfiguriert oder nicht erreichbar - keine automatische Auswertung möglich.';
+  await pgPool.query(
+    'UPDATE paper_insights SET trade_count = $1, insight_text = $2, generated_at = now() WHERE id = 1',
+    [closedCount, insightText]
   );
 }
 
@@ -592,6 +845,8 @@ app.get('/api/paper-trading/state', async (req, res) => {
     const { rows: openRows } = await pgPool.query("SELECT * FROM paper_trades WHERE status = 'open' ORDER BY opened_at DESC");
     const { rows: closedRows } = await pgPool.query("SELECT * FROM paper_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM paper_balance_history ORDER BY time ASC');
+    const { rows: skippedRows } = await pgPool.query('SELECT * FROM paper_skipped_setups ORDER BY created_at DESC LIMIT 50');
+    const { rows: insightRows } = await pgPool.query('SELECT trade_count, insight_text, generated_at FROM paper_insights WHERE id = 1');
 
     const openTrades = openRows.map(rowToTrade).map(t => {
       const currentPrice = paperLastPrices[t.symbol] ?? null;
@@ -605,8 +860,14 @@ app.get('/api/paper-trading/state', async (req, res) => {
     });
     const closedTrades = closedRows.map(rowToTrade);
     const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
+    const skippedSetups = skippedRows.map(rowToSkipped);
+    const insights = insightRows.length ? {
+      tradeCount: insightRows[0].trade_count,
+      text: insightRows[0].insight_text,
+      generatedAt: insightRows[0].generated_at ? new Date(insightRows[0].generated_at).getTime() : null
+    } : null;
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, lastCheck: settings.lastCheck });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, insights, lastCheck: settings.lastCheck });
   } catch (err) {
     console.error('Paper-Trading: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
