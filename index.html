@@ -3171,6 +3171,81 @@
     font-family: 'JetBrains Mono', monospace;
   }
 
+  .at-update-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 6px;
+    font-size: 0.72rem;
+    color: var(--text-dim);
+  }
+
+  .at-save-toast {
+    color: #7CFFC4;
+    background: rgba(52,226,154,0.1);
+    border: 1px solid rgba(52,226,154,0.35);
+    border-radius: 999px;
+    padding: 3px 12px;
+    font-size: 0.72rem;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+  }
+
+  .at-save-toast.show { opacity: 1; }
+
+  .at-total-pnl-row {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .at-trade-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 6px 14px;
+    font-size: 0.76rem;
+    margin: 4px 0;
+  }
+
+  .at-trade-grid-item {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .at-trade-grid-label {
+    font-size: 0.6rem;
+    letter-spacing: 0.4px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+  }
+
+  .at-trade-grid-value {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text);
+  }
+
+  .at-trade-details {
+    margin-top: 4px;
+  }
+
+  .at-trade-details summary {
+    cursor: pointer;
+    font-size: 0.7rem;
+    color: var(--cyan);
+    user-select: none;
+  }
+
+  .at-trade-details-text {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    margin-top: 4px;
+    line-height: 1.4;
+  }
+
   .trade-liq-warning {
     font-size: 0.68rem;
     color: #ffb0bc;
@@ -3559,6 +3634,10 @@
         </div>
 
         <div class="at-sim-banner">⚠ SIMULATION — kein echtes Geld im Einsatz. Es werden keine echten MEXC-Orders ausgeführt.</div>
+        <div class="at-update-row">
+          <span class="mono" id="atUpdateInfo">—</span>
+          <span class="at-save-toast" id="atSaveToast">Einstellungen gespeichert ✓</span>
+        </div>
 
         <div class="news-body">
 
@@ -3603,6 +3682,9 @@
 
           <div class="panel-card">
             <div class="panel-title">OFFENE PAPER-POSITIONEN</div>
+            <div class="at-total-pnl-row" id="atOpenTotalPnl" style="display:none;">
+              Unrealisierter Gesamt-PnL: <span class="mono" id="atOpenTotalPnlValue">--</span>
+            </div>
             <div class="trade-list" id="atOpenList"><div class="notes-empty">Keine offenen Positionen.</div></div>
           </div>
 
@@ -3612,7 +3694,7 @@
           </div>
 
           <div class="panel-card">
-            <div class="panel-title">ÜBERSPRUNGENE SETUPS <span class="card-title-hint">— technisch erkannt, von Gemini abgelehnt</span></div>
+            <div class="panel-title">ÜBERSPRUNGENE SETUPS <span class="card-title-hint">— Sweep+BOS gefunden, an Zusatzkriterien gescheitert</span></div>
             <div class="trade-list" id="atSkippedList"><div class="notes-empty">Noch keine übersprungenen Setups.</div></div>
           </div>
 
@@ -6847,18 +6929,28 @@
     return badges.length ? `<div class="trade-criteria-badges">${badges.join('')}</div>` : '';
   }
 
+  // Dynamische Nachkommastellen: kleine Preise brauchen mehr Präzision,
+  // sonst würde z.B. ein 0,0005-USDT-Coin als "0,00" angezeigt.
+  function formatAutoPrice(value) {
+    if (value == null || isNaN(value)) return '--';
+    const abs = Math.abs(value);
+    const decimals = abs < 1 ? 6 : abs < 100 ? 4 : 2;
+    return value.toLocaleString('de-DE', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  }
+
   function atSkippedRowHtml(s) {
     const dirClass = s.direction === 'long' ? 'long' : 'short';
     const dirLabel = s.direction === 'long' ? 'LONG' : 'SHORT';
     const time = new Date(s.createdAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
     const badges = atCriteriaBadgesHtml(s.criteriaTrend, s.criteriaVolume, s.criteriaMtf);
+    const geminiNote = s.geminiReasoning ? `<div class="trade-gemini-note">🤖 ${escapeHtml(s.geminiReasoning)}</div>` : '';
     return `<div class="trade-row">
       <div class="trade-row-top">
         <span class="trade-sym">${escapeHtml(s.symbol.replace('USDT', '/USDT'))}</span>
         <span class="trade-dir ${dirClass}">${dirLabel}</span>
       </div>
       ${badges}
-      <div class="trade-gemini-note">🤖 ${escapeHtml(s.geminiReasoning || '')}</div>
+      ${geminiNote}
       <div class="trade-row-bottom">
         <span class="trade-time mono">${time} · ${escapeHtml(s.reason || '')}</span>
       </div>
@@ -6888,14 +6980,34 @@
     const pnlClass = (pnl == null) ? '' : (pnl >= 0 ? 'up' : 'down');
     const pnlText = (pnl == null) ? '--' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}€`;
     const time = new Date(isOpen ? t.openedAt : t.closedAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
-    const priceInfo = isOpen
-      ? `${formatPrice(t.entryPrice)} → ${t.currentPrice != null ? formatPrice(t.currentPrice) : '--'}`
-      : `${formatPrice(t.entryPrice)} → ${formatPrice(t.exitPrice)} (${t.closeReason})`;
     const liqWarning = t.liquidatesFirst
-      ? `<div class="trade-liq-warning">⚠ Hebel ${t.leverage}x: Liquidation (${formatPrice(t.liquidationPrice)}) liegt näher am Einstieg als der technische SL — würde real vor dem SL liquidiert.</div>`
+      ? `<div class="trade-liq-warning">⚠ Hebel ${t.leverage}x: Liquidation (${formatAutoPrice(t.liquidationPrice)}) liegt näher am Einstieg als der technische SL — würde real vor dem SL liquidiert.</div>`
       : '';
     const badges = atCriteriaBadgesHtml(t.criteriaTrend, t.criteriaVolume, t.criteriaMtf);
     const geminiNote = t.geminiReasoning ? `<div class="trade-gemini-note">🤖 ${escapeHtml(t.geminiReasoning)}</div>` : '';
+
+    const gridItems = isOpen
+      ? [
+          ['Einstieg → Aktuell', `${formatAutoPrice(t.entryPrice)} → ${t.currentPrice != null ? formatAutoPrice(t.currentPrice) : '--'}`],
+          ['Stop-Loss', formatAutoPrice(t.stopLoss)],
+          ['Take-Profit', formatAutoPrice(t.takeProfit)],
+          ['Liquidation', t.liquidationPrice != null ? formatAutoPrice(t.liquidationPrice) : '--'],
+          ['Margin', `${t.marginEur.toFixed(2)}€`],
+          ['Positionsgröße', `${t.positionSizeEur.toFixed(2)}€`]
+        ]
+      : [
+          ['Einstieg → Exit', `${formatAutoPrice(t.entryPrice)} → ${formatAutoPrice(t.exitPrice)}`],
+          ['Grund', t.closeReason],
+          ['Stop-Loss', formatAutoPrice(t.stopLoss)],
+          ['Take-Profit', formatAutoPrice(t.takeProfit)],
+          ['Liquidation', t.liquidationPrice != null ? formatAutoPrice(t.liquidationPrice) : '--'],
+          ['Margin', `${t.marginEur.toFixed(2)}€`]
+        ];
+    const gridHtml = gridItems.map(([label, value]) => `
+      <div class="at-trade-grid-item">
+        <span class="at-trade-grid-label">${escapeHtml(label)}</span>
+        <span class="at-trade-grid-value">${escapeHtml(String(value))}</span>
+      </div>`).join('');
 
     return `<div class="trade-row">
       <div class="trade-row-top">
@@ -6903,20 +7015,17 @@
         <span class="trade-dir ${dirClass}">${dirLabel} · ${t.leverage}x</span>
       </div>
       ${badges}
-      <div class="trade-row-mid mono">
-        <span>${priceInfo}</span>
-        <span>SL ${formatPrice(t.stopLoss)} / TP ${formatPrice(t.takeProfit)}</span>
-      </div>
-      <div class="trade-row-mid mono">
-        <span>Liq. ${t.liquidationPrice != null ? formatPrice(t.liquidationPrice) : '--'}</span>
-        <span>Margin ${t.marginEur.toFixed(2)}€</span>
-      </div>
+      <div class="at-trade-grid">${gridHtml}</div>
       ${liqWarning}
       ${geminiNote}
       <div class="trade-row-bottom">
-        <span class="trade-time mono">${time} · ${escapeHtml(t.reason || '')}</span>
+        <span class="trade-time mono">${time}</span>
         <span class="trade-pnl mono ${pnlClass}">${pnlText}</span>
       </div>
+      <details class="at-trade-details">
+        <summary>Details (Erkennungsgrund)</summary>
+        <div class="at-trade-details-text">${escapeHtml(t.reason || '')}</div>
+      </details>
     </div>`;
   }
 
@@ -7014,9 +7123,26 @@
       atDrawBalanceChart(data.balanceHistory);
 
       const openEl = document.getElementById('atOpenList');
-      openEl.innerHTML = (data.openTrades && data.openTrades.length)
-        ? data.openTrades.map(t => atTradeRowHtml(t, true)).join('')
+      const openTrades = data.openTrades || [];
+      openEl.innerHTML = openTrades.length
+        ? openTrades.map(t => atTradeRowHtml(t, true)).join('')
         : '<div class="notes-empty">Keine offenen Positionen.</div>';
+
+      const totalPnlRow = document.getElementById('atOpenTotalPnl');
+      const totalPnlValue = document.getElementById('atOpenTotalPnlValue');
+      if (totalPnlRow && totalPnlValue) {
+        if (openTrades.length) {
+          const totalPnl = openTrades.reduce((sum, t) => sum + (t.unrealizedPnlEur || 0), 0);
+          totalPnlValue.textContent = `${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}€`;
+          totalPnlValue.className = 'mono ' + (totalPnl >= 0 ? 'up' : 'down');
+          totalPnlRow.style.display = 'block';
+        } else {
+          totalPnlRow.style.display = 'none';
+        }
+      }
+
+      atLastLoadTime = Date.now();
+      updateAtUpdateInfo();
 
       const closedEl = document.getElementById('atClosedList');
       closedEl.innerHTML = closed.length
@@ -7090,13 +7216,24 @@
     loadAutoTraderState();
   }
 
+  function showAtSaveToast() {
+    const toast = document.getElementById('atSaveToast');
+    if (!toast) return;
+    toast.classList.add('show');
+    clearTimeout(showAtSaveToast._t);
+    showAtSaveToast._t = setTimeout(() => toast.classList.remove('show'), 2500);
+  }
+
   document.getElementById('atEnableToggle').addEventListener('click', () => {
     const btn = document.getElementById('atEnableToggle');
     const nowEnabled = !btn.classList.contains('on');
     atSaveSettings(nowEnabled);
   });
 
-  document.getElementById('atSaveSettingsBtn').addEventListener('click', () => atSaveSettings());
+  document.getElementById('atSaveSettingsBtn').addEventListener('click', () => {
+    atSaveSettings();
+    showAtSaveToast();
+  });
 
   document.getElementById('atResetBtn').addEventListener('click', async () => {
     if (!confirm('Paper-Trading-Simulation wirklich zurücksetzen? Balance-Verlauf und alle offenen/geschlossenen Paper-Trades werden gelöscht.')) return;
@@ -7105,11 +7242,20 @@
     loadAutoTraderState();
   });
 
+  let atLastLoadTime = null;
+  function updateAtUpdateInfo() {
+    const el = document.getElementById('atUpdateInfo');
+    if (!el || !atLastLoadTime) return;
+    const secs = Math.round((Date.now() - atLastLoadTime) / 1000);
+    el.textContent = secs < 2 ? 'Gerade aktualisiert' : `Aktualisiert vor ${secs}s`;
+  }
+  setInterval(updateAtUpdateInfo, 1000);
+
   setInterval(() => {
     if (viewPanels.autotrader && viewPanels.autotrader.style.display !== 'none') {
       loadAutoTraderState();
     }
-  }, 60000);
+  }, 30000);
 
   // ============ Initialer Zustand ============
   renderTradingFeed();

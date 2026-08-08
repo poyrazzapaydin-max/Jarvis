@@ -242,7 +242,15 @@ const PAPER_DEFAULT_SETTINGS = {
   enabled: false,
   riskPerTradeEur: 0.5,
   riskRewardRatio: 2,
-  watchedSymbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+  watchedSymbols: [
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT',
+    'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT',
+    'TAOUSDT', 'ZECUSDT', 'TRXUSDT', 'TONUSDT', 'SHIBUSDT',
+    'LTCUSDT', 'BCHUSDT', 'NEARUSDT', 'UNIUSDT', 'APTUSDT',
+    'ICPUSDT', 'ETCUSDT', 'ATOMUSDT', 'FILUSDT', 'ARBUSDT',
+    'OPUSDT', 'SUIUSDT', 'INJUSDT', 'RENDERUSDT', 'HBARUSDT',
+    'VETUSDT', 'FTMUSDT', 'ALGOUSDT', 'SEIUSDT', 'AAVEUSDT'
+  ],
   startCapitalEur: 100,
   maxOpenPositions: 3,
   leverage: 5,
@@ -587,76 +595,6 @@ function checkMultiTimeframe(candles1h, direction, currentPrice) {
   }
 }
 
-// ---- Leichte technische Indikatoren für den Gemini-Kontext (Server-Variante,
-// da die vorhandenen SMA/RSI/MACD-Funktionen im Frontend liegen und dort
-// nicht ohne Weiteres server-seitig wiederverwendbar sind - hier bewusst
-// kompakt neu implementiert statt dupliziert einzubinden). ----
-function calcServerRsi(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0, losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff >= 0) gains += diff; else losses -= diff;
-  }
-  const avgGain = gains / period, avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
-}
-
-function calcServerMacd(closes) {
-  if (closes.length < 35) return null;
-  const ema = (values, period) => {
-    const k = 2 / (period + 1);
-    let prev = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
-    const out = [prev];
-    for (let i = period; i < values.length; i++) {
-      prev = values[i] * k + prev * (1 - k);
-      out.push(prev);
-    }
-    return out;
-  };
-  const ema12 = ema(closes, 12);
-  const ema26 = ema(closes, 26);
-  const offset = ema12.length - ema26.length;
-  const macdLine = ema26.map((v, i) => ema12[i + offset] - v);
-  const signalLine = ema(macdLine, 9);
-  const macd = macdLine[macdLine.length - 1];
-  const signal = signalLine[signalLine.length - 1];
-  return { macd, signal, histogram: macd - signal };
-}
-
-// NUR SIMULATION - fragt Gemini als Gegencheck vor Eröffnung eines Paper-
-// Trades. Löst zu keinem Zeitpunkt eine echte Order aus, ruft ausschließlich
-// die eigene Gemini-Textgenerierung auf. Bei fehlendem GEMINI_API_KEY wird
-// der Trade automatisch freigegeben (kein Gegencheck technisch möglich) -
-// das wird in der Begründung transparent vermerkt.
-async function askGeminiTradeCheck({ symbol, direction, setup, criteria, candles5m, rsi, macd }) {
-  const currentPrice = candles5m[candles5m.length - 1].close;
-  const recentPrices = candles5m.slice(-12).map(c => c.close.toFixed(4)).join(', ');
-  const prompt = `Du bist ein erfahrener, nüchterner Krypto-Trader. Bewerte folgendes automatisch erkanntes Paper-Trading-Setup (reine Simulation, kein echtes Geld):
-
-Coin: ${symbol}
-Richtung: ${direction === 'long' ? 'LONG' : 'SHORT'}
-Erkanntes Muster: ${setup.reason}
-Aktueller Kurs: ${currentPrice}
-Letzte Kurse (5-Min, älteste zuerst): ${recentPrices}
-RSI(14, 5m): ${rsi != null ? rsi.toFixed(1) : 'nicht verfügbar'}
-MACD-Histogramm(5m): ${macd ? macd.histogram.toFixed(6) : 'nicht verfügbar'}
-Zusatzkriterien bereits erfüllt: Trend ${criteria.trend.pass ? 'JA' : 'NEIN'}, Volumen ${criteria.volume.pass ? 'JA' : 'NEIN'}, Mehrere-Zeitebenen ${criteria.mtf.pass ? 'JA' : 'NEIN'}
-
-Gib eine kurze Einschätzung in 2-3 Sätzen ab, ob dieses Setup in diesem Kontext wirklich sinnvoll erscheint oder ob es Gegenargumente gibt. Schreibe zum Schluss als letztes Wort/letzte Zeile klar maschinenlesbar: "ENTSCHEIDUNG: JA" wenn der Trade eröffnet werden soll, oder "ENTSCHEIDUNG: NEIN" wenn nicht.`;
-
-  const text = await callGeminiText(prompt);
-  if (!text) {
-    return { approved: true, reasoning: 'Gemini nicht konfiguriert oder nicht erreichbar - Trade automatisch freigegeben (kein Gegencheck möglich).' };
-  }
-  const match = text.toUpperCase().match(/ENTSCHEIDUNG:\s*(JA|NEIN)/);
-  const approved = match ? match[1] === 'JA' : true; // unklare Antwort -> konservativ freigeben, aber vermerken
-  const reasoning = match ? text.trim() : `${text.trim()} [Hinweis: keine eindeutige ENTSCHEIDUNG erkannt, Trade sicherheitshalber freigegeben]`;
-  return { approved, reasoning };
-}
-
 // Hebel-Berechnung (siehe Erklärung im Chat für die Herleitung):
 // - Der Stop-Loss bleibt am technischen Sweep-Level (unverändert durch Hebel).
 // - Positionsgröße (Nominalwert) = Max. Risiko€ * Hebel / prozentualer SL-Abstand,
@@ -811,34 +749,27 @@ async function checkPaperSymbol(symbol, settings) {
 
   if (failed.length) {
     await logCheck({ sweepBosFound: true, direction: setup.direction, failedCriteria: failed.join(', '), note: `Sweep+BOS gefunden, aber ${failed.join(', ')} nicht erfüllt.` });
-    return;
-  }
-
-  await logCheck({ sweepBosFound: true, direction: setup.direction, failedCriteria: null, note: 'Sweep+BOS gefunden, alle aktivierten Zusatzkriterien erfüllt - an Gemini zur Prüfung geschickt.' });
-
-  // Punkt 2: Gemini als Gegencheck, bevor der Trade wirklich eröffnet wird.
-  const closes5m = candles.map(c => c.close);
-  const rsi = calcServerRsi(closes5m, 14);
-  const macd = calcServerMacd(closes5m);
-  const geminiResult = await askGeminiTradeCheck({ symbol, direction: setup.direction, setup, criteria, candles5m: candles, rsi, macd });
-
-  const entryPrice = lastPrice;
-
-  if (!geminiResult.approved) {
+    // Technisch gescheiterte Setups landen jetzt (statt der früheren
+    // Gemini-Ablehnungen) in "Übersprungene Setups", damit nachvollziehbar
+    // bleibt, was erkannt aber wegen der Zusatzkriterien verworfen wurde.
     await pgPool.query(
       `INSERT INTO paper_skipped_setups (id, symbol, direction, reason, criteria_trend, criteria_volume, criteria_mtf, gemini_reasoning)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [crypto.randomUUID(), symbol, setup.direction, setup.reason, trend.pass, volume.pass, mtf.pass, geminiResult.reasoning]
+       VALUES ($1, $2, $3, $4, $5, $6, $7, NULL)`,
+      [crypto.randomUUID(), symbol, setup.direction, setup.reason, trend.pass, volume.pass, mtf.pass]
     );
     return;
   }
 
+  await logCheck({ sweepBosFound: true, direction: setup.direction, failedCriteria: null, note: 'Sweep+BOS gefunden, alle aktivierten Zusatzkriterien erfüllt - Trade eröffnet.' });
+
+  // Kein Gemini-Gegencheck mehr: Trade wird direkt eröffnet, sobald alle
+  // aktivierten technischen Kriterien erfüllt sind.
+  const entryPrice = lastPrice;
   const plan = computePaperTradePlan(setup.direction, entryPrice, setup.sweepExtreme, settings);
-  const fullReason = `${setup.reason} Gemini-Gegencheck: ${geminiResult.reasoning}`;
   await pgPool.query(
-    `INSERT INTO paper_trades (id, symbol, direction, entry_price, stop_loss, take_profit, position_size_eur, risk_eur, leverage, margin_eur, liquidation_price, liquidates_first, criteria_trend, criteria_volume, criteria_mtf, gemini_reasoning, reason, status, opened_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'open', now())`,
-    [crypto.randomUUID(), symbol, setup.direction, entryPrice, plan.stopLoss, plan.takeProfit, plan.positionSizeEur, settings.riskPerTradeEur, plan.leverage, plan.marginEur, plan.liquidationPrice, plan.liquidatesFirst, trend.pass, volume.pass, mtf.pass, geminiResult.reasoning, fullReason]
+    `INSERT INTO paper_trades (id, symbol, direction, entry_price, stop_loss, take_profit, position_size_eur, risk_eur, leverage, margin_eur, liquidation_price, liquidates_first, criteria_trend, criteria_volume, criteria_mtf, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, entryPrice, plan.stopLoss, plan.takeProfit, plan.positionSizeEur, settings.riskPerTradeEur, plan.leverage, plan.marginEur, plan.liquidationPrice, plan.liquidatesFirst, trend.pass, volume.pass, mtf.pass, setup.reason]
   );
 }
 
