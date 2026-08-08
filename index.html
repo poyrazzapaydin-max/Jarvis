@@ -3004,6 +3004,77 @@
     border-color: rgba(255,92,114,0.5);
   }
 
+  /* ---- Auto Trader (Paper Trading) ---- */
+  .mini-toggle-btn {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.5px;
+    padding: 10px 18px;
+    border-radius: 10px;
+    cursor: pointer;
+    border: 1px solid rgba(255,92,114,0.35);
+    background: rgba(255,92,114,0.08);
+    color: #ffb0bc;
+    transition: all 0.15s ease;
+  }
+
+  .mini-toggle-btn.on {
+    border-color: rgba(52,226,154,0.4);
+    background: rgba(52,226,154,0.1);
+    color: #7CFFC4;
+  }
+
+  .at-sim-banner {
+    margin: 10px 0 4px;
+    padding: 10px 16px;
+    border-radius: 10px;
+    border: 1px solid rgba(255,190,60,0.35);
+    background: rgba(255,190,60,0.08);
+    color: #ffd980;
+    font-size: 0.8rem;
+    letter-spacing: 0.2px;
+  }
+
+  .at-settings-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 14px;
+    margin-bottom: 4px;
+  }
+
+  .at-settings-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    letter-spacing: 0.4px;
+  }
+
+  .at-coin-select {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .at-coin-chip {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+    transition: all 0.15s ease;
+  }
+
+  .at-coin-chip.active {
+    color: var(--cyan);
+    border-color: rgba(56,226,255,0.5);
+    background: rgba(56,226,255,0.1);
+  }
+
   /* Scrollbars */
   ::-webkit-scrollbar { width: 8px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -3048,6 +3119,9 @@
         </div>
         <div class="nav-item" data-view="portfolio">
           <span class="icon">◧</span> Portfolio
+        </div>
+        <div class="nav-item" data-view="autotrader">
+          <span class="icon">🤖</span> Auto Trader
         </div>
         <div class="nav-item" data-view="analyse">
           <span class="icon">🧠</span> Analyse
@@ -3357,6 +3431,65 @@
             <div class="trade-list" id="lastTradesList">
               <div class="notes-empty">Noch keine Trade-Historie geladen.</div>
             </div>
+          </div>
+
+        </div>
+      </div>
+
+      <!-- Auto Trader view (Paper Trading — reine Simulation, keine echten Orders) -->
+      <div class="view-flex-col" id="view-autotrader" style="display:none;">
+        <div class="portfolio-header">
+          <div>
+            <div class="view-panel-title">AUTO TRADER</div>
+            <div class="portfolio-claim">Paper Trading — Simulation</div>
+          </div>
+          <button class="mini-toggle-btn off" id="atEnableToggle">🔴 SIMULATION AUS</button>
+        </div>
+
+        <div class="at-sim-banner">⚠ SIMULATION — kein echtes Geld im Einsatz. Es werden keine echten MEXC-Orders ausgeführt.</div>
+
+        <div class="news-body">
+
+          <div class="panel-card">
+            <div class="panel-title">REGELWERK</div>
+            <div class="at-settings-grid">
+              <label>Max. Risiko / Trade (€)<input type="number" step="0.1" min="0.1" class="select-input" id="atRisk"></label>
+              <label>Risk/Reward (1 : X)<input type="number" step="0.5" min="1" class="select-input" id="atRR"></label>
+              <label>Start-Kapital (€)<input type="number" step="1" min="1" class="select-input" id="atStartCapital"></label>
+              <label>Max. offene Positionen<input type="number" step="1" min="1" max="10" class="select-input" id="atMaxPositions"></label>
+            </div>
+            <div class="panel-title" style="margin-top:14px;">BEOBACHTETE COINS</div>
+            <div class="at-coin-select" id="atCoinSelect"></div>
+            <div class="quick-action-row" style="margin-top:14px;">
+              <button class="big-analyze-btn" id="atSaveSettingsBtn" style="padding:11px 24px; font-size:0.8rem;">Einstellungen speichern</button>
+              <button class="quick-action-btn danger" id="atResetBtn">⟲ Simulation zurücksetzen</button>
+            </div>
+            <div class="trades-range-info mono" id="atLastCheckInfo"></div>
+          </div>
+
+          <div class="portfolio-stats-row">
+            <div class="stat-box"><div class="stat-label">PAPER-BALANCE</div><div class="stat-value mono" id="atBalance">--</div></div>
+            <div class="stat-box"><div class="stat-label">GESAMTERGEBNIS</div><div class="stat-value mono" id="atTotalResult">--</div></div>
+            <div class="stat-box"><div class="stat-label">TRADES GESAMT</div><div class="stat-value mono" id="atTradeCount">--</div></div>
+            <div class="stat-box"><div class="stat-label">GEWINNRATE</div><div class="stat-value mono" id="atWinRate">--</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">PAPER-BALANCE-VERLAUF</div>
+            <div class="portfolio-chart-wrap" style="height:180px;">
+              <canvas id="atBalanceChart" width="900" height="180"></canvas>
+              <div class="chart-placeholder-msg" id="atChartPlaceholder">Noch keine Verlaufsdaten.</div>
+            </div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">OFFENE PAPER-POSITIONEN</div>
+            <div class="trade-list" id="atOpenList"><div class="notes-empty">Keine offenen Positionen.</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">GESCHLOSSENE PAPER-TRADES</div>
+            <div class="trade-list" id="atClosedList"><div class="notes-empty">Noch keine geschlossenen Trades.</div></div>
           </div>
 
         </div>
@@ -3751,6 +3884,7 @@
   const titles = {
     trading: 'Trading',
     portfolio: 'Portfolio',
+    autotrader: 'Auto Trader',
     analyse: 'Analyse',
     news: 'News',
     aicore: 'AI Core',
@@ -3764,6 +3898,7 @@
   const viewPanels = {
     trading: document.getElementById('view-trading'),
     portfolio: document.getElementById('view-portfolio'),
+    autotrader: document.getElementById('view-autotrader'),
     analyse: document.getElementById('view-analyse'),
     news: document.getElementById('view-news'),
     aicore: document.getElementById('view-aicore'),
@@ -3791,6 +3926,9 @@
     }
     if (key === 'kalender' && typeof updateNowLine === 'function') {
       setTimeout(updateNowLine, 0);
+    }
+    if (key === 'autotrader' && typeof loadAutoTraderState === 'function') {
+      loadAutoTraderState();
     }
   }
 
@@ -6521,6 +6659,208 @@
     a.remove();
     URL.revokeObjectURL(url);
   });
+
+  // ============ AUTO TRADER (Paper Trading, reine Simulation) ============
+  // Diese Sektion ruft ausschließlich den eigenen Backend-Endpoint auf, der
+  // wiederum nur öffentliche Binance-Kursdaten liest. Es gibt hier keinen
+  // Aufruf, der eine echte MEXC-Order auslösen könnte.
+  let atSelectedSymbols = [];
+
+  function atCoinChipsHtml() {
+    return BINANCE_SYMBOLS.map(sym => {
+      const active = atSelectedSymbols.includes(sym);
+      return `<span class="at-coin-chip${active ? ' active' : ''}" data-sym="${sym}">${sym.replace('USDT', '/USDT')}</span>`;
+    }).join('');
+  }
+
+  function atRenderCoinChips() {
+    const el = document.getElementById('atCoinSelect');
+    if (!el) return;
+    el.innerHTML = atCoinChipsHtml();
+    el.querySelectorAll('.at-coin-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const sym = chip.dataset.sym;
+        if (atSelectedSymbols.includes(sym)) {
+          atSelectedSymbols = atSelectedSymbols.filter(s => s !== sym);
+        } else {
+          atSelectedSymbols.push(sym);
+        }
+        atRenderCoinChips();
+      });
+    });
+  }
+
+  function atTradeRowHtml(t, isOpen) {
+    const dirClass = t.direction === 'long' ? 'long' : 'short';
+    const dirLabel = t.direction === 'long' ? 'LONG' : 'SHORT';
+    const pnl = isOpen ? t.unrealizedPnlEur : t.pnlEur;
+    const pnlClass = (pnl == null) ? '' : (pnl >= 0 ? 'up' : 'down');
+    const pnlText = (pnl == null) ? '--' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}€`;
+    const time = new Date(isOpen ? t.openedAt : t.closedAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    const priceInfo = isOpen
+      ? `${formatPrice(t.entryPrice)} → ${t.currentPrice != null ? formatPrice(t.currentPrice) : '--'}`
+      : `${formatPrice(t.entryPrice)} → ${formatPrice(t.exitPrice)} (${t.closeReason})`;
+
+    return `<div class="trade-row">
+      <div class="trade-row-top">
+        <span class="trade-sym">${escapeHtml(t.symbol.replace('USDT', '/USDT'))}</span>
+        <span class="trade-dir ${dirClass}">${dirLabel}</span>
+      </div>
+      <div class="trade-row-mid mono">
+        <span>${priceInfo}</span>
+        <span>SL ${formatPrice(t.stopLoss)} / TP ${formatPrice(t.takeProfit)}</span>
+      </div>
+      <div class="trade-row-bottom">
+        <span class="trade-time mono">${time} · ${escapeHtml(t.reason || '')}</span>
+        <span class="trade-pnl mono ${pnlClass}">${pnlText}</span>
+      </div>
+    </div>`;
+  }
+
+  function atDrawBalanceChart(history) {
+    const canvas = document.getElementById('atBalanceChart');
+    const placeholder = document.getElementById('atChartPlaceholder');
+    if (!canvas) return;
+    if (!history || history.length < 2) {
+      placeholder.classList.add('show');
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+    placeholder.classList.remove('show');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, rect.width, rect.height);
+
+    const values = history.map(p => p.balance);
+    const min = Math.min(...values), max = Math.max(...values);
+    const range = (max - min) || 1;
+    const padTop = 10, padBottom = 10;
+    const usableH = rect.height - padTop - padBottom;
+    const stepX = history.length > 1 ? rect.width / (history.length - 1) : rect.width;
+    const coords = history.map((p, i) => ({ x: i * stepX, y: padTop + usableH - ((p.balance - min) / range) * usableH }));
+
+    const isUp = values[values.length - 1] >= values[0];
+    const lineColor = isUp ? '#34e29a' : '#ff5c72';
+
+    ctx.beginPath();
+    ctx.moveTo(coords[0].x, rect.height);
+    coords.forEach(c => ctx.lineTo(c.x, c.y));
+    ctx.lineTo(coords[coords.length - 1].x, rect.height);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, 0, 0, rect.height);
+    grad.addColorStop(0, isUp ? 'rgba(52,226,154,0.18)' : 'rgba(255,92,114,0.18)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    ctx.beginPath();
+    coords.forEach((c, i) => i === 0 ? ctx.moveTo(c.x, c.y) : ctx.lineTo(c.x, c.y));
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+  }
+
+  async function loadAutoTraderState() {
+    try {
+      const res = await fetch('/api/paper-trading/state');
+      const data = await res.json();
+
+      atSelectedSymbols = data.settings.watchedSymbols.slice();
+      atRenderCoinChips();
+
+      document.getElementById('atRisk').value = data.settings.riskPerTradeEur;
+      document.getElementById('atRR').value = data.settings.riskRewardRatio;
+      document.getElementById('atStartCapital').value = data.settings.startCapitalEur;
+      document.getElementById('atMaxPositions').value = data.settings.maxOpenPositions;
+
+      const toggleBtn = document.getElementById('atEnableToggle');
+      toggleBtn.classList.toggle('on', data.settings.enabled);
+      toggleBtn.classList.toggle('off', !data.settings.enabled);
+      toggleBtn.textContent = data.settings.enabled ? '🟢 SIMULATION AN' : '🔴 SIMULATION AUS';
+
+      const balance = data.balanceEur;
+      const start = data.settings.startCapitalEur;
+      const resultEur = balance - start;
+      const resultPct = start ? (resultEur / start) * 100 : 0;
+      document.getElementById('atBalance').textContent = `${balance.toFixed(2)}€`;
+      const resultEl = document.getElementById('atTotalResult');
+      resultEl.textContent = `${resultEur >= 0 ? '+' : ''}${resultEur.toFixed(2)}€ (${resultPct >= 0 ? '+' : ''}${resultPct.toFixed(1)}%)`;
+      resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
+
+      const closed = data.closedTrades || [];
+      document.getElementById('atTradeCount').textContent = String(closed.length);
+      const wins = closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('atWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+
+      atDrawBalanceChart(data.balanceHistory);
+
+      const openEl = document.getElementById('atOpenList');
+      openEl.innerHTML = (data.openTrades && data.openTrades.length)
+        ? data.openTrades.map(t => atTradeRowHtml(t, true)).join('')
+        : '<div class="notes-empty">Keine offenen Positionen.</div>';
+
+      const closedEl = document.getElementById('atClosedList');
+      closedEl.innerHTML = closed.length
+        ? closed.map(t => atTradeRowHtml(t, false)).join('')
+        : '<div class="notes-empty">Noch keine geschlossenen Trades.</div>';
+
+      const lastCheckEl = document.getElementById('atLastCheckInfo');
+      if (lastCheckEl) {
+        lastCheckEl.textContent = data.lastCheck
+          ? `Letzte Prüfung: ${new Date(data.lastCheck).toLocaleString('de-DE')}`
+          : 'Noch keine Prüfung durchgeführt.';
+      }
+    } catch (err) {
+      console.error('Auto Trader: Laden fehlgeschlagen', err);
+    }
+  }
+
+  async function atSaveSettings(enabledOverride) {
+    const toggleBtn = document.getElementById('atEnableToggle');
+    const enabled = enabledOverride !== undefined ? enabledOverride : toggleBtn.classList.contains('on');
+    const body = {
+      enabled,
+      riskPerTradeEur: parseFloat(document.getElementById('atRisk').value),
+      riskRewardRatio: parseFloat(document.getElementById('atRR').value),
+      startCapitalEur: parseFloat(document.getElementById('atStartCapital').value),
+      maxOpenPositions: parseInt(document.getElementById('atMaxPositions').value, 10),
+      watchedSymbols: atSelectedSymbols
+    };
+    await fetch('/api/paper-trading/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    addFeedEntry('Auto-Trader-Einstellungen gespeichert');
+    loadAutoTraderState();
+  }
+
+  document.getElementById('atEnableToggle').addEventListener('click', () => {
+    const btn = document.getElementById('atEnableToggle');
+    const nowEnabled = !btn.classList.contains('on');
+    atSaveSettings(nowEnabled);
+  });
+
+  document.getElementById('atSaveSettingsBtn').addEventListener('click', () => atSaveSettings());
+
+  document.getElementById('atResetBtn').addEventListener('click', async () => {
+    if (!confirm('Paper-Trading-Simulation wirklich zurücksetzen? Balance-Verlauf und alle offenen/geschlossenen Paper-Trades werden gelöscht.')) return;
+    await fetch('/api/paper-trading/reset', { method: 'POST' });
+    addFeedEntry('Auto-Trader-Simulation zurückgesetzt');
+    loadAutoTraderState();
+  });
+
+  setInterval(() => {
+    if (viewPanels.autotrader && viewPanels.autotrader.style.display !== 'none') {
+      loadAutoTraderState();
+    }
+  }, 60000);
 
   // ============ Initialer Zustand ============
   renderTradingFeed();

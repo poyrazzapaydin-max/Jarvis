@@ -16,6 +16,7 @@
 
 try { require('dotenv').config(); } catch (err) { /* dotenv optional, z.B. auf Render nicht nötig */ }
 
+const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
@@ -189,6 +190,293 @@ app.post('/api/mexc-proxy', async (req, res) => {
     console.error('Proxy-Fehler:', err);
     res.status(500).json({ error: err.message || 'Proxy-Fehler.' });
   }
+});
+
+// ============================================================
+// AUTO TRADER - Paper Trading (reine Simulation)
+//
+// SICHERHEIT: Dieser gesamte Block liest NUR öffentliche Binance-
+// Kursdaten (keine Authentifizierung, kein MEXC-Zugriff) und
+// verändert ausschließlich lokal gespeicherte, simulierte Werte.
+// Es gibt hier KEINEN Codepfad, der eine echte Order auf MEXC oder
+// einer anderen Börse auslösen könnte. NICHT AUTOMATISCH AUSFÜHREN
+// - NUR SIMULATION. Falls das jemals in echten Handel überführt
+// werden soll, müsste an dieser Stelle bewusst und separat ein
+// echter, signierter Order-Endpoint ergänzt werden - das ist NICHT
+// Teil dieses Codes.
+// ============================================================
+const PAPER_DATA_FILE = path.join(__dirname, 'paper-trading-data.json');
+
+const PAPER_DEFAULT_SETTINGS = {
+  enabled: false,
+  riskPerTradeEur: 0.5,
+  riskRewardRatio: 2,
+  watchedSymbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+  startCapitalEur: 100,
+  maxOpenPositions: 3
+};
+
+function loadPaperData() {
+  try {
+    const raw = fs.readFileSync(PAPER_DATA_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    parsed.settings = { ...PAPER_DEFAULT_SETTINGS, ...(parsed.settings || {}) };
+    parsed.lastPrices = parsed.lastPrices || {};
+    return parsed;
+  } catch (err) {
+    return {
+      settings: { ...PAPER_DEFAULT_SETTINGS },
+      balanceEur: PAPER_DEFAULT_SETTINGS.startCapitalEur,
+      balanceHistory: [{ time: Date.now(), balance: PAPER_DEFAULT_SETTINGS.startCapitalEur }],
+      openTrades: [],
+      closedTrades: [],
+      lastPrices: {},
+      lastCheck: null
+    };
+  }
+}
+
+function savePaperData() {
+  try {
+    fs.writeFileSync(PAPER_DATA_FILE, JSON.stringify(paperData, null, 2));
+  } catch (err) {
+    console.error('Paper-Trading: Speichern fehlgeschlagen:', err);
+  }
+}
+
+let paperData = loadPaperData();
+
+async function fetchPaperCandles(symbol, interval = '15m', limit = 200) {
+  const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
+  if (!res.ok) throw new Error(`Kline-Fehler für ${symbol}: HTTP ${res.status}`);
+  const raw = await res.json();
+  return raw.map(k => ({ time: Number(k[0]), open: Number(k[1]), high: Number(k[2]), low: Number(k[3]), close: Number(k[4]) }));
+}
+
+// Lokale Hoch-/Tiefpunkte: eine Kerze gilt als "lokal", wenn ihr High/Low
+// extremer ist als das der `lookback` Kerzen davor UND danach.
+function findLocalExtrema(candles, lookback = 4) {
+  const highs = [], lows = [];
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    const windowSlice = candles.slice(i - lookback, i + lookback + 1);
+    if (candles[i].high === Math.max(...windowSlice.map(c => c.high))) {
+      highs.push({ index: i, price: candles[i].high });
+    }
+    if (candles[i].low === Math.min(...windowSlice.map(c => c.low))) {
+      lows.push({ index: i, price: candles[i].low });
+    }
+  }
+  return { highs, lows };
+}
+
+// Vereinfachte Heuristik, keine Garantie für korrekte Mustererkennung.
+// Erkennt: Liquidation Sweep (Docht durchbricht ein vorheriges lokales
+// Hoch/Tief, Schlusskurs kehrt zurück) gefolgt von einem Break of
+// Structure (Schlusskurs durchbricht ein vorheriges lokales Hoch/Tief)
+// innerhalb eines Fensters von ~15 Kerzen, nahe (<=2%) der Sweep-Zone.
+// Interpretation der "Support/Resistance-Nähe": die gesweepte Zone
+// selbst dient als Referenzlevel für die Abstandsprüfung.
+function detectPaperSetup(candles) {
+  const { highs, lows } = findLocalExtrema(candles, 4);
+  const n = candles.length;
+  const windowSize = 15;
+  const searchStart = Math.max(0, n - windowSize - 10);
+
+  const downSweeps = [];
+  const upBos = [];
+  for (let i = searchStart; i < n; i++) {
+    const priorLows = lows.filter(l => l.index < i);
+    if (priorLows.length) {
+      const refLow = priorLows[priorLows.length - 1];
+      if (candles[i].low < refLow.price && candles[i].close > refLow.price) {
+        downSweeps.push({ index: i, sweptLevel: refLow.price, sweepExtreme: candles[i].low });
+      }
+    }
+    const priorHighs = highs.filter(h => h.index < i);
+    if (priorHighs.length) {
+      const refHigh = priorHighs[priorHighs.length - 1];
+      if (candles[i].close > refHigh.price) {
+        upBos.push({ index: i, brokenLevel: refHigh.price });
+      }
+    }
+  }
+  for (const sweep of downSweeps) {
+    const bos = upBos.find(b => b.index > sweep.index && b.index - sweep.index <= windowSize);
+    if (bos) {
+      const distancePct = Math.abs(candles[bos.index].close - sweep.sweptLevel) / sweep.sweptLevel * 100;
+      if (distancePct <= 2) {
+        return {
+          direction: 'long',
+          sweepExtreme: sweep.sweepExtreme,
+          reason: `Liquidation Sweep unter ${sweep.sweptLevel.toFixed(4)}, danach Break of Structure über ${bos.brokenLevel.toFixed(4)} (${distancePct.toFixed(2)}% Abstand zur Zone).`
+        };
+      }
+    }
+  }
+
+  const upSweeps = [];
+  const downBos = [];
+  for (let i = searchStart; i < n; i++) {
+    const priorHighs = highs.filter(h => h.index < i);
+    if (priorHighs.length) {
+      const refHigh = priorHighs[priorHighs.length - 1];
+      if (candles[i].high > refHigh.price && candles[i].close < refHigh.price) {
+        upSweeps.push({ index: i, sweptLevel: refHigh.price, sweepExtreme: candles[i].high });
+      }
+    }
+    const priorLows = lows.filter(l => l.index < i);
+    if (priorLows.length) {
+      const refLow = priorLows[priorLows.length - 1];
+      if (candles[i].close < refLow.price) {
+        downBos.push({ index: i, brokenLevel: refLow.price });
+      }
+    }
+  }
+  for (const sweep of upSweeps) {
+    const bos = downBos.find(b => b.index > sweep.index && b.index - sweep.index <= windowSize);
+    if (bos) {
+      const distancePct = Math.abs(candles[bos.index].close - sweep.sweptLevel) / sweep.sweptLevel * 100;
+      if (distancePct <= 2) {
+        return {
+          direction: 'short',
+          sweepExtreme: sweep.sweepExtreme,
+          reason: `Liquidation Sweep über ${sweep.sweptLevel.toFixed(4)}, danach Break of Structure unter ${bos.brokenLevel.toFixed(4)} (${distancePct.toFixed(2)}% Abstand zur Zone).`
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function computePaperTradePlan(direction, entryPrice, sweepExtreme, settings) {
+  const bufferPct = 0.0015;
+  let stopLoss, distance;
+  if (direction === 'long') {
+    stopLoss = sweepExtreme * (1 - bufferPct);
+    distance = entryPrice - stopLoss;
+  } else {
+    stopLoss = sweepExtreme * (1 + bufferPct);
+    distance = stopLoss - entryPrice;
+  }
+  const distancePct = distance / entryPrice;
+  const takeProfit = direction === 'long'
+    ? entryPrice + distance * settings.riskRewardRatio
+    : entryPrice - distance * settings.riskRewardRatio;
+  const positionSizeEur = distancePct > 0 ? settings.riskPerTradeEur / distancePct : 0;
+  return { stopLoss, takeProfit, positionSizeEur };
+}
+
+// NUR SIMULATION - prüft offene Paper-Trades auf SL/TP und öffnet ggf.
+// neue Paper-Trades. Löst zu keinem Zeitpunkt eine echte Order aus.
+async function checkPaperSymbol(symbol) {
+  const candles = await fetchPaperCandles(symbol, '15m', 200);
+  const lastPrice = candles[candles.length - 1].close;
+  paperData.lastPrices[symbol] = lastPrice;
+
+  paperData.openTrades = paperData.openTrades.filter(trade => {
+    if (trade.symbol !== symbol) return true;
+    let closeReason = null;
+    if (trade.direction === 'long') {
+      if (lastPrice >= trade.takeProfit) closeReason = 'TP';
+      else if (lastPrice <= trade.stopLoss) closeReason = 'SL';
+    } else {
+      if (lastPrice <= trade.takeProfit) closeReason = 'TP';
+      else if (lastPrice >= trade.stopLoss) closeReason = 'SL';
+    }
+    if (!closeReason) return true;
+
+    const exitPrice = lastPrice;
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    paperData.balanceEur += pnlEur;
+    paperData.balanceHistory.push({ time: Date.now(), balance: paperData.balanceEur });
+    paperData.closedTrades.unshift({ ...trade, exitPrice, closeReason, pnlEur, closedAt: Date.now() });
+    if (paperData.closedTrades.length > 200) paperData.closedTrades.length = 200;
+    return false;
+  });
+
+  const hasOpenForSymbol = paperData.openTrades.some(t => t.symbol === symbol);
+  if (hasOpenForSymbol || paperData.openTrades.length >= paperData.settings.maxOpenPositions) return;
+
+  const setup = detectPaperSetup(candles);
+  if (!setup) return;
+
+  const entryPrice = lastPrice;
+  const plan = computePaperTradePlan(setup.direction, entryPrice, setup.sweepExtreme, paperData.settings);
+  paperData.openTrades.push({
+    id: crypto.randomUUID(),
+    symbol,
+    direction: setup.direction,
+    entryPrice,
+    stopLoss: plan.stopLoss,
+    takeProfit: plan.takeProfit,
+    positionSizeEur: plan.positionSizeEur,
+    riskEur: paperData.settings.riskPerTradeEur,
+    reason: setup.reason,
+    openedAt: Date.now()
+  });
+}
+
+async function runPaperTradingCycle() {
+  if (!paperData.settings.enabled) return;
+  for (const symbol of paperData.settings.watchedSymbols) {
+    try {
+      await checkPaperSymbol(symbol);
+    } catch (err) {
+      console.error(`Paper-Trading-Fehler bei ${symbol}:`, err.message || err);
+    }
+  }
+  paperData.lastCheck = Date.now();
+  savePaperData();
+}
+
+const PAPER_CHECK_INTERVAL_MS = 7 * 60 * 1000; // alle 7 Minuten (Vorgabe: 5-10 Min)
+setInterval(runPaperTradingCycle, PAPER_CHECK_INTERVAL_MS);
+
+app.get('/api/paper-trading/state', (req, res) => {
+  const openWithPnl = paperData.openTrades.map(t => {
+    const currentPrice = paperData.lastPrices[t.symbol] ?? null;
+    let unrealizedPnlEur = null;
+    if (currentPrice != null) {
+      unrealizedPnlEur = t.direction === 'long'
+        ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
+        : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
+    }
+    return { ...t, currentPrice, unrealizedPnlEur };
+  });
+  res.json({ ...paperData, openTrades: openWithPnl });
+});
+
+app.post('/api/paper-trading/settings', (req, res) => {
+  const incoming = req.body || {};
+  const wasEnabled = paperData.settings.enabled;
+  paperData.settings = {
+    enabled: !!incoming.enabled,
+    riskPerTradeEur: Number(incoming.riskPerTradeEur) > 0 ? Number(incoming.riskPerTradeEur) : paperData.settings.riskPerTradeEur,
+    riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : paperData.settings.riskRewardRatio,
+    watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : paperData.settings.watchedSymbols,
+    startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : paperData.settings.startCapitalEur,
+    maxOpenPositions: Number(incoming.maxOpenPositions) > 0 ? Number(incoming.maxOpenPositions) : paperData.settings.maxOpenPositions
+  };
+  savePaperData();
+  if (paperData.settings.enabled && !wasEnabled) runPaperTradingCycle();
+  res.json({ ok: true, settings: paperData.settings });
+});
+
+app.post('/api/paper-trading/reset', (req, res) => {
+  paperData = {
+    settings: paperData.settings,
+    balanceEur: paperData.settings.startCapitalEur,
+    balanceHistory: [{ time: Date.now(), balance: paperData.settings.startCapitalEur }],
+    openTrades: [],
+    closedTrades: [],
+    lastPrices: {},
+    lastCheck: null
+  };
+  savePaperData();
+  res.json({ ok: true });
 });
 
 const PORT = process.env.PORT || 5055;
