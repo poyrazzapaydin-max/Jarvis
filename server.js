@@ -279,6 +279,18 @@ async function initPaperTradingSchema() {
       balance NUMERIC NOT NULL
     );
   `);
+
+  // Migration für Spalten, die nachträglich (nach dem ersten Deploy) hinzukamen -
+  // "CREATE TABLE IF NOT EXISTS" ergänzt bei bereits existierenden Tabellen
+  // KEINE neuen Spalten, daher hier explizit per ALTER nachziehen. Idempotent,
+  // läuft bei jedem Start.
+  await pgPool.query('ALTER TABLE paper_settings ADD COLUMN IF NOT EXISTS max_open_positions INTEGER NOT NULL DEFAULT 3');
+  await pgPool.query('ALTER TABLE paper_settings ADD COLUMN IF NOT EXISTS leverage INTEGER NOT NULL DEFAULT 5');
+  await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS leverage INTEGER NOT NULL DEFAULT 1');
+  await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS margin_eur NUMERIC NOT NULL DEFAULT 0');
+  await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS liquidation_price NUMERIC');
+  await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS liquidates_first BOOLEAN NOT NULL DEFAULT false');
+
   const { rows } = await pgPool.query('SELECT id FROM paper_settings WHERE id = 1');
   if (!rows.length) {
     await pgPool.query(
