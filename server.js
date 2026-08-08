@@ -219,7 +219,8 @@ const PAPER_DEFAULT_SETTINGS = {
   riskRewardRatio: 2,
   watchedSymbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
   startCapitalEur: 100,
-  maxOpenPositions: 3
+  maxOpenPositions: 3,
+  leverage: 5
 };
 
 // In-Memory-Cache nur für zuletzt gesehene Live-Preise (rein informativ
@@ -244,6 +245,7 @@ async function initPaperTradingSchema() {
       start_capital_eur NUMERIC NOT NULL DEFAULT 100,
       balance_eur NUMERIC NOT NULL DEFAULT 100,
       max_open_positions INTEGER NOT NULL DEFAULT 3,
+      leverage INTEGER NOT NULL DEFAULT 5,
       last_check TIMESTAMPTZ
     );
   `);
@@ -257,6 +259,10 @@ async function initPaperTradingSchema() {
       take_profit NUMERIC NOT NULL,
       position_size_eur NUMERIC NOT NULL,
       risk_eur NUMERIC NOT NULL,
+      leverage INTEGER NOT NULL DEFAULT 1,
+      margin_eur NUMERIC NOT NULL DEFAULT 0,
+      liquidation_price NUMERIC,
+      liquidates_first BOOLEAN NOT NULL DEFAULT false,
       reason TEXT,
       status TEXT NOT NULL DEFAULT 'open',
       opened_at TIMESTAMPTZ NOT NULL,
@@ -276,9 +282,9 @@ async function initPaperTradingSchema() {
   const { rows } = await pgPool.query('SELECT id FROM paper_settings WHERE id = 1');
   if (!rows.length) {
     await pgPool.query(
-      `INSERT INTO paper_settings (id, enabled, risk_per_trade_eur, risk_reward_ratio, watched_symbols, start_capital_eur, balance_eur)
-       VALUES (1, false, $1, $2, $3, $4, $4)`,
-      [PAPER_DEFAULT_SETTINGS.riskPerTradeEur, PAPER_DEFAULT_SETTINGS.riskRewardRatio, PAPER_DEFAULT_SETTINGS.watchedSymbols, PAPER_DEFAULT_SETTINGS.startCapitalEur]
+      `INSERT INTO paper_settings (id, enabled, risk_per_trade_eur, risk_reward_ratio, watched_symbols, start_capital_eur, balance_eur, leverage)
+       VALUES (1, false, $1, $2, $3, $4, $4, $5)`,
+      [PAPER_DEFAULT_SETTINGS.riskPerTradeEur, PAPER_DEFAULT_SETTINGS.riskRewardRatio, PAPER_DEFAULT_SETTINGS.watchedSymbols, PAPER_DEFAULT_SETTINGS.startCapitalEur, PAPER_DEFAULT_SETTINGS.leverage]
     );
     await pgPool.query('INSERT INTO paper_balance_history (balance) VALUES ($1)', [PAPER_DEFAULT_SETTINGS.startCapitalEur]);
   }
@@ -293,6 +299,7 @@ function rowToSettings(row) {
     startCapitalEur: Number(row.start_capital_eur),
     balanceEur: Number(row.balance_eur),
     maxOpenPositions: Number(row.max_open_positions),
+    leverage: Number(row.leverage),
     lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
   };
 }
@@ -312,6 +319,10 @@ function rowToTrade(row) {
     takeProfit: Number(row.take_profit),
     positionSizeEur: Number(row.position_size_eur),
     riskEur: Number(row.risk_eur),
+    leverage: Number(row.leverage),
+    marginEur: Number(row.margin_eur),
+    liquidationPrice: row.liquidation_price != null ? Number(row.liquidation_price) : null,
+    liquidatesFirst: row.liquidates_first,
     reason: row.reason,
     openedAt: new Date(row.opened_at).getTime(),
     exitPrice: row.exit_price != null ? Number(row.exit_price) : null,
@@ -424,8 +435,24 @@ function detectPaperSetup(candles) {
   return null;
 }
 
+// Hebel-Berechnung (siehe Erklärung im Chat für die Herleitung):
+// - Der Stop-Loss bleibt am technischen Sweep-Level (unverändert durch Hebel).
+// - Positionsgröße (Nominalwert) = Max. Risiko€ * Hebel / prozentualer SL-Abstand,
+//   d.h. bei höherem Hebel wird für dasselbe Margin-Kapital eine größere
+//   Position eröffnet -> derselbe technische SL/TP-Move ergibt ein um den
+//   Hebel vervielfachtes Euro-Ergebnis.
+// - Margin (eingesetztes Kapital) = Positionsgröße / Hebel = Risiko€ / SL-Abstand%
+//   (unabhängig vom Hebel - der Hebel bestimmt nur, wie viel Nominalwert
+//   diese Margin kontrolliert).
+// - Liquidationspreis (grobe Näherung, ohne Gebühren/Maintenance-Margin):
+//   ca. 1/Hebel prozentuale Gegenbewegung vom Einstieg entfernt.
+// - Liegt der Liquidationspreis NÄHER am Einstieg als der technische SL,
+//   würde die Position real schon vor dem SL liquidiert werden -> Warnung
+//   (liquidatesFirst) und die Simulation behandelt das als Totalverlust
+//   der Margin statt eines normalen SL-Treffers.
 function computePaperTradePlan(direction, entryPrice, sweepExtreme, settings) {
   const bufferPct = 0.0015;
+  const leverage = Math.max(1, Number(settings.leverage) || 1);
   let stopLoss, distance;
   if (direction === 'long') {
     stopLoss = sweepExtreme * (1 - bufferPct);
@@ -438,8 +465,17 @@ function computePaperTradePlan(direction, entryPrice, sweepExtreme, settings) {
   const takeProfit = direction === 'long'
     ? entryPrice + distance * settings.riskRewardRatio
     : entryPrice - distance * settings.riskRewardRatio;
-  const positionSizeEur = distancePct > 0 ? settings.riskPerTradeEur / distancePct : 0;
-  return { stopLoss, takeProfit, positionSizeEur };
+
+  const positionSizeEur = distancePct > 0 ? (settings.riskPerTradeEur * leverage) / distancePct : 0;
+  const marginEur = leverage > 0 ? positionSizeEur / leverage : positionSizeEur;
+
+  const liquidationDistancePct = 1 / leverage;
+  const liquidationPrice = direction === 'long'
+    ? entryPrice * (1 - liquidationDistancePct)
+    : entryPrice * (1 + liquidationDistancePct);
+  const liquidatesFirst = liquidationDistancePct < distancePct;
+
+  return { stopLoss, takeProfit, positionSizeEur, marginEur, leverage, liquidationPrice, liquidatesFirst };
 }
 
 // NUR SIMULATION - prüft offene Paper-Trades auf SL/TP und öffnet ggf.
@@ -459,7 +495,21 @@ async function checkPaperSymbol(symbol, settings) {
   for (const row of openRows) {
     const trade = rowToTrade(row);
     let closeReason = null;
-    if (trade.direction === 'long') {
+    let exitPrice = lastPrice;
+    let pnlEur = null;
+
+    // NUR SIMULATION: Liquidation wird zuerst geprüft, da der Liquidationspreis
+    // bei hohem Hebel näher am Einstieg liegen kann als der technische SL -
+    // in der Realität würde die Position dann bereits vorher zwangsgeschlossen.
+    const liquidationHit = trade.liquidationPrice != null && trade.direction === 'long'
+      ? lastPrice <= trade.liquidationPrice
+      : trade.liquidationPrice != null && lastPrice >= trade.liquidationPrice;
+
+    if (trade.liquidatesFirst && liquidationHit) {
+      closeReason = 'LIQUIDATION';
+      exitPrice = trade.liquidationPrice;
+      pnlEur = -trade.marginEur; // Totalverlust der Margin
+    } else if (trade.direction === 'long') {
       if (lastPrice >= trade.takeProfit) closeReason = 'TP';
       else if (lastPrice <= trade.stopLoss) closeReason = 'SL';
     } else {
@@ -468,10 +518,11 @@ async function checkPaperSymbol(symbol, settings) {
     }
     if (!closeReason) continue;
 
-    const exitPrice = lastPrice;
-    const pnlEur = trade.direction === 'long'
-      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
-      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    if (pnlEur === null) {
+      pnlEur = trade.direction === 'long'
+        ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+        : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    }
 
     await pgPool.query(
       `UPDATE paper_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`,
@@ -499,9 +550,9 @@ async function checkPaperSymbol(symbol, settings) {
   const entryPrice = lastPrice;
   const plan = computePaperTradePlan(setup.direction, entryPrice, setup.sweepExtreme, settings);
   await pgPool.query(
-    `INSERT INTO paper_trades (id, symbol, direction, entry_price, stop_loss, take_profit, position_size_eur, risk_eur, reason, status, opened_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', now())`,
-    [crypto.randomUUID(), symbol, setup.direction, entryPrice, plan.stopLoss, plan.takeProfit, plan.positionSizeEur, settings.riskPerTradeEur, setup.reason]
+    `INSERT INTO paper_trades (id, symbol, direction, entry_price, stop_loss, take_profit, position_size_eur, risk_eur, leverage, margin_eur, liquidation_price, liquidates_first, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, entryPrice, plan.stopLoss, plan.takeProfit, plan.positionSizeEur, settings.riskPerTradeEur, plan.leverage, plan.marginEur, plan.liquidationPrice, plan.liquidatesFirst, setup.reason]
   );
 }
 
@@ -562,11 +613,12 @@ app.post('/api/paper-trading/settings', async (req, res) => {
       riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : current.riskRewardRatio,
       watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols,
       startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
-      maxOpenPositions: Number(incoming.maxOpenPositions) > 0 ? Number(incoming.maxOpenPositions) : current.maxOpenPositions
+      maxOpenPositions: Number(incoming.maxOpenPositions) > 0 ? Number(incoming.maxOpenPositions) : current.maxOpenPositions,
+      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage
     };
     await pgPool.query(
-      `UPDATE paper_settings SET enabled = $1, risk_per_trade_eur = $2, risk_reward_ratio = $3, watched_symbols = $4, start_capital_eur = $5, max_open_positions = $6 WHERE id = 1`,
-      [next.enabled, next.riskPerTradeEur, next.riskRewardRatio, next.watchedSymbols, next.startCapitalEur, next.maxOpenPositions]
+      `UPDATE paper_settings SET enabled = $1, risk_per_trade_eur = $2, risk_reward_ratio = $3, watched_symbols = $4, start_capital_eur = $5, max_open_positions = $6, leverage = $7 WHERE id = 1`,
+      [next.enabled, next.riskPerTradeEur, next.riskRewardRatio, next.watchedSymbols, next.startCapitalEur, next.maxOpenPositions, next.leverage]
     );
 
     if (next.enabled && !wasEnabled) runPaperTradingCycle();
