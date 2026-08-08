@@ -16,12 +16,12 @@
 
 try { require('dotenv').config(); } catch (err) { /* dotenv optional, z.B. auf Render nicht nötig */ }
 
-const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(cors());
@@ -32,6 +32,14 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
+const DATABASE_URL = process.env.DATABASE_URL || '';
+
+// ---- Postgres-Verbindung (für Auto-Trader / Paper-Trading-Daten) ----
+// Render-Postgres verlangt SSL, erlaubt aber kein eigenes Zertifikat -
+// daher rejectUnauthorized:false (Standardpraxis für Render/Heroku-Postgres).
+const pgPool = DATABASE_URL
+  ? new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
 
 // ============================================================
 // Frontend ausliefern (index.html, config.js entfällt komplett)
@@ -205,8 +213,6 @@ app.post('/api/mexc-proxy', async (req, res) => {
 // echter, signierter Order-Endpoint ergänzt werden - das ist NICHT
 // Teil dieses Codes.
 // ============================================================
-const PAPER_DATA_FILE = path.join(__dirname, 'paper-trading-data.json');
-
 const PAPER_DEFAULT_SETTINGS = {
   enabled: false,
   riskPerTradeEur: 0.5,
@@ -216,35 +222,104 @@ const PAPER_DEFAULT_SETTINGS = {
   maxOpenPositions: 3
 };
 
-function loadPaperData() {
-  try {
-    const raw = fs.readFileSync(PAPER_DATA_FILE, 'utf8');
-    const parsed = JSON.parse(raw);
-    parsed.settings = { ...PAPER_DEFAULT_SETTINGS, ...(parsed.settings || {}) };
-    parsed.lastPrices = parsed.lastPrices || {};
-    return parsed;
-  } catch (err) {
-    return {
-      settings: { ...PAPER_DEFAULT_SETTINGS },
-      balanceEur: PAPER_DEFAULT_SETTINGS.startCapitalEur,
-      balanceHistory: [{ time: Date.now(), balance: PAPER_DEFAULT_SETTINGS.startCapitalEur }],
-      openTrades: [],
-      closedTrades: [],
-      lastPrices: {},
-      lastCheck: null
-    };
+// In-Memory-Cache nur für zuletzt gesehene Live-Preise (rein informativ
+// für "unrealized P/L" in der UI, keine persistenten Daten, muss nicht
+// in der DB liegen).
+const paperLastPrices = {};
+
+// Legt die Tabellen an, falls sie noch nicht existieren, und sorgt für
+// genau eine Einstellungs-Zeile (Singleton, id=1).
+async function initPaperTradingSchema() {
+  if (!pgPool) {
+    console.warn('Paper-Trading: DATABASE_URL nicht gesetzt - Auto Trader ist deaktiviert.');
+    return;
+  }
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS paper_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      risk_per_trade_eur NUMERIC NOT NULL DEFAULT 0.5,
+      risk_reward_ratio NUMERIC NOT NULL DEFAULT 2,
+      watched_symbols TEXT[] NOT NULL DEFAULT ARRAY['BTCUSDT','ETHUSDT','SOLUSDT'],
+      start_capital_eur NUMERIC NOT NULL DEFAULT 100,
+      balance_eur NUMERIC NOT NULL DEFAULT 100,
+      max_open_positions INTEGER NOT NULL DEFAULT 3,
+      last_check TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS paper_trades (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      entry_price NUMERIC NOT NULL,
+      stop_loss NUMERIC NOT NULL,
+      take_profit NUMERIC NOT NULL,
+      position_size_eur NUMERIC NOT NULL,
+      risk_eur NUMERIC NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      opened_at TIMESTAMPTZ NOT NULL,
+      exit_price NUMERIC,
+      close_reason TEXT,
+      pnl_eur NUMERIC,
+      closed_at TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS paper_balance_history (
+      id SERIAL PRIMARY KEY,
+      time TIMESTAMPTZ NOT NULL DEFAULT now(),
+      balance NUMERIC NOT NULL
+    );
+  `);
+  const { rows } = await pgPool.query('SELECT id FROM paper_settings WHERE id = 1');
+  if (!rows.length) {
+    await pgPool.query(
+      `INSERT INTO paper_settings (id, enabled, risk_per_trade_eur, risk_reward_ratio, watched_symbols, start_capital_eur, balance_eur)
+       VALUES (1, false, $1, $2, $3, $4, $4)`,
+      [PAPER_DEFAULT_SETTINGS.riskPerTradeEur, PAPER_DEFAULT_SETTINGS.riskRewardRatio, PAPER_DEFAULT_SETTINGS.watchedSymbols, PAPER_DEFAULT_SETTINGS.startCapitalEur]
+    );
+    await pgPool.query('INSERT INTO paper_balance_history (balance) VALUES ($1)', [PAPER_DEFAULT_SETTINGS.startCapitalEur]);
   }
 }
 
-function savePaperData() {
-  try {
-    fs.writeFileSync(PAPER_DATA_FILE, JSON.stringify(paperData, null, 2));
-  } catch (err) {
-    console.error('Paper-Trading: Speichern fehlgeschlagen:', err);
-  }
+function rowToSettings(row) {
+  return {
+    enabled: row.enabled,
+    riskPerTradeEur: Number(row.risk_per_trade_eur),
+    riskRewardRatio: Number(row.risk_reward_ratio),
+    watchedSymbols: row.watched_symbols,
+    startCapitalEur: Number(row.start_capital_eur),
+    balanceEur: Number(row.balance_eur),
+    maxOpenPositions: Number(row.max_open_positions),
+    lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
+  };
 }
 
-let paperData = loadPaperData();
+async function getPaperSettings() {
+  const { rows } = await pgPool.query('SELECT * FROM paper_settings WHERE id = 1');
+  return rowToSettings(rows[0]);
+}
+
+function rowToTrade(row) {
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    direction: row.direction,
+    entryPrice: Number(row.entry_price),
+    stopLoss: Number(row.stop_loss),
+    takeProfit: Number(row.take_profit),
+    positionSizeEur: Number(row.position_size_eur),
+    riskEur: Number(row.risk_eur),
+    reason: row.reason,
+    openedAt: new Date(row.opened_at).getTime(),
+    exitPrice: row.exit_price != null ? Number(row.exit_price) : null,
+    closeReason: row.close_reason,
+    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null,
+    closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null
+  };
+}
 
 async function fetchPaperCandles(symbol, interval = '15m', limit = 200) {
   const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
@@ -369,13 +444,20 @@ function computePaperTradePlan(direction, entryPrice, sweepExtreme, settings) {
 
 // NUR SIMULATION - prüft offene Paper-Trades auf SL/TP und öffnet ggf.
 // neue Paper-Trades. Löst zu keinem Zeitpunkt eine echte Order aus.
-async function checkPaperSymbol(symbol) {
+// maxOpenPositions wird als Parameter übergeben (statt erneut abgefragt),
+// da mehrere Coins pro Zyklus dieselbe Settings-Zeile teilen.
+async function checkPaperSymbol(symbol, settings) {
   const candles = await fetchPaperCandles(symbol, '15m', 200);
   const lastPrice = candles[candles.length - 1].close;
-  paperData.lastPrices[symbol] = lastPrice;
+  paperLastPrices[symbol] = lastPrice;
 
-  paperData.openTrades = paperData.openTrades.filter(trade => {
-    if (trade.symbol !== symbol) return true;
+  const { rows: openRows } = await pgPool.query(
+    "SELECT * FROM paper_trades WHERE symbol = $1 AND status = 'open'",
+    [symbol]
+  );
+
+  for (const row of openRows) {
+    const trade = rowToTrade(row);
     let closeReason = null;
     if (trade.direction === 'long') {
       if (lastPrice >= trade.takeProfit) closeReason = 'TP';
@@ -384,104 +466,144 @@ async function checkPaperSymbol(symbol) {
       if (lastPrice <= trade.takeProfit) closeReason = 'TP';
       else if (lastPrice >= trade.stopLoss) closeReason = 'SL';
     }
-    if (!closeReason) return true;
+    if (!closeReason) continue;
 
     const exitPrice = lastPrice;
     const pnlEur = trade.direction === 'long'
       ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
       : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
-    paperData.balanceEur += pnlEur;
-    paperData.balanceHistory.push({ time: Date.now(), balance: paperData.balanceEur });
-    paperData.closedTrades.unshift({ ...trade, exitPrice, closeReason, pnlEur, closedAt: Date.now() });
-    if (paperData.closedTrades.length > 200) paperData.closedTrades.length = 200;
-    return false;
-  });
 
-  const hasOpenForSymbol = paperData.openTrades.some(t => t.symbol === symbol);
-  if (hasOpenForSymbol || paperData.openTrades.length >= paperData.settings.maxOpenPositions) return;
+    await pgPool.query(
+      `UPDATE paper_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`,
+      [exitPrice, closeReason, pnlEur, trade.id]
+    );
+    const { rows: balRows } = await pgPool.query(
+      'UPDATE paper_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur',
+      [pnlEur]
+    );
+    await pgPool.query('INSERT INTO paper_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+  }
+
+  const { rows: stillOpenForSymbol } = await pgPool.query(
+    "SELECT COUNT(*)::int AS c FROM paper_trades WHERE symbol = $1 AND status = 'open'",
+    [symbol]
+  );
+  if (stillOpenForSymbol[0].c > 0) return;
+
+  const { rows: totalOpenRows } = await pgPool.query("SELECT COUNT(*)::int AS c FROM paper_trades WHERE status = 'open'");
+  if (totalOpenRows[0].c >= settings.maxOpenPositions) return;
 
   const setup = detectPaperSetup(candles);
   if (!setup) return;
 
   const entryPrice = lastPrice;
-  const plan = computePaperTradePlan(setup.direction, entryPrice, setup.sweepExtreme, paperData.settings);
-  paperData.openTrades.push({
-    id: crypto.randomUUID(),
-    symbol,
-    direction: setup.direction,
-    entryPrice,
-    stopLoss: plan.stopLoss,
-    takeProfit: plan.takeProfit,
-    positionSizeEur: plan.positionSizeEur,
-    riskEur: paperData.settings.riskPerTradeEur,
-    reason: setup.reason,
-    openedAt: Date.now()
-  });
+  const plan = computePaperTradePlan(setup.direction, entryPrice, setup.sweepExtreme, settings);
+  await pgPool.query(
+    `INSERT INTO paper_trades (id, symbol, direction, entry_price, stop_loss, take_profit, position_size_eur, risk_eur, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, entryPrice, plan.stopLoss, plan.takeProfit, plan.positionSizeEur, settings.riskPerTradeEur, setup.reason]
+  );
 }
 
 async function runPaperTradingCycle() {
-  if (!paperData.settings.enabled) return;
-  for (const symbol of paperData.settings.watchedSymbols) {
+  if (!pgPool) return;
+  const settings = await getPaperSettings();
+  if (!settings.enabled) return;
+  for (const symbol of settings.watchedSymbols) {
     try {
-      await checkPaperSymbol(symbol);
+      await checkPaperSymbol(symbol, settings);
     } catch (err) {
       console.error(`Paper-Trading-Fehler bei ${symbol}:`, err.message || err);
     }
   }
-  paperData.lastCheck = Date.now();
-  savePaperData();
+  await pgPool.query('UPDATE paper_settings SET last_check = now() WHERE id = 1');
 }
 
 const PAPER_CHECK_INTERVAL_MS = 7 * 60 * 1000; // alle 7 Minuten (Vorgabe: 5-10 Min)
 setInterval(runPaperTradingCycle, PAPER_CHECK_INTERVAL_MS);
 
-app.get('/api/paper-trading/state', (req, res) => {
-  const openWithPnl = paperData.openTrades.map(t => {
-    const currentPrice = paperData.lastPrices[t.symbol] ?? null;
-    let unrealizedPnlEur = null;
-    if (currentPrice != null) {
-      unrealizedPnlEur = t.direction === 'long'
-        ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
-        : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
-    }
-    return { ...t, currentPrice, unrealizedPnlEur };
-  });
-  res.json({ ...paperData, openTrades: openWithPnl });
+app.get('/api/paper-trading/state', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Auto Trader nicht verfügbar.' });
+  try {
+    const settings = await getPaperSettings();
+    const { rows: openRows } = await pgPool.query("SELECT * FROM paper_trades WHERE status = 'open' ORDER BY opened_at DESC");
+    const { rows: closedRows } = await pgPool.query("SELECT * FROM paper_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
+    const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM paper_balance_history ORDER BY time ASC');
+
+    const openTrades = openRows.map(rowToTrade).map(t => {
+      const currentPrice = paperLastPrices[t.symbol] ?? null;
+      let unrealizedPnlEur = null;
+      if (currentPrice != null) {
+        unrealizedPnlEur = t.direction === 'long'
+          ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
+          : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
+      }
+      return { ...t, currentPrice, unrealizedPnlEur };
+    });
+    const closedTrades = closedRows.map(rowToTrade);
+    const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
+
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, lastCheck: settings.lastCheck });
+  } catch (err) {
+    console.error('Paper-Trading: state-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
 });
 
-app.post('/api/paper-trading/settings', (req, res) => {
-  const incoming = req.body || {};
-  const wasEnabled = paperData.settings.enabled;
-  paperData.settings = {
-    enabled: !!incoming.enabled,
-    riskPerTradeEur: Number(incoming.riskPerTradeEur) > 0 ? Number(incoming.riskPerTradeEur) : paperData.settings.riskPerTradeEur,
-    riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : paperData.settings.riskRewardRatio,
-    watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : paperData.settings.watchedSymbols,
-    startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : paperData.settings.startCapitalEur,
-    maxOpenPositions: Number(incoming.maxOpenPositions) > 0 ? Number(incoming.maxOpenPositions) : paperData.settings.maxOpenPositions
-  };
-  savePaperData();
-  if (paperData.settings.enabled && !wasEnabled) runPaperTradingCycle();
-  res.json({ ok: true, settings: paperData.settings });
+app.post('/api/paper-trading/settings', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Auto Trader nicht verfügbar.' });
+  try {
+    const incoming = req.body || {};
+    const current = await getPaperSettings();
+    const wasEnabled = current.enabled;
+    const next = {
+      enabled: !!incoming.enabled,
+      riskPerTradeEur: Number(incoming.riskPerTradeEur) > 0 ? Number(incoming.riskPerTradeEur) : current.riskPerTradeEur,
+      riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : current.riskRewardRatio,
+      watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols,
+      startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
+      maxOpenPositions: Number(incoming.maxOpenPositions) > 0 ? Number(incoming.maxOpenPositions) : current.maxOpenPositions
+    };
+    await pgPool.query(
+      `UPDATE paper_settings SET enabled = $1, risk_per_trade_eur = $2, risk_reward_ratio = $3, watched_symbols = $4, start_capital_eur = $5, max_open_positions = $6 WHERE id = 1`,
+      [next.enabled, next.riskPerTradeEur, next.riskRewardRatio, next.watchedSymbols, next.startCapitalEur, next.maxOpenPositions]
+    );
+
+    if (next.enabled && !wasEnabled) runPaperTradingCycle();
+    res.json({ ok: true, settings: next });
+  } catch (err) {
+    console.error('Paper-Trading: settings-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
 });
 
-app.post('/api/paper-trading/reset', (req, res) => {
-  paperData = {
-    settings: paperData.settings,
-    balanceEur: paperData.settings.startCapitalEur,
-    balanceHistory: [{ time: Date.now(), balance: paperData.settings.startCapitalEur }],
-    openTrades: [],
-    closedTrades: [],
-    lastPrices: {},
-    lastCheck: null
-  };
-  savePaperData();
-  res.json({ ok: true });
+app.post('/api/paper-trading/reset', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Auto Trader nicht verfügbar.' });
+  try {
+    const settings = await getPaperSettings();
+    await pgPool.query('DELETE FROM paper_trades');
+    await pgPool.query('DELETE FROM paper_balance_history');
+    await pgPool.query('UPDATE paper_settings SET balance_eur = $1, last_check = NULL WHERE id = 1', [settings.startCapitalEur]);
+    await pgPool.query('INSERT INTO paper_balance_history (balance) VALUES ($1)', [settings.startCapitalEur]);
+    Object.keys(paperLastPrices).forEach(k => delete paperLastPrices[k]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Paper-Trading: reset-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
 });
 
 const PORT = process.env.PORT || 5055;
+
+initPaperTradingSchema()
+  .then(() => {
+    if (pgPool) console.log('Paper-Trading: Datenbank-Schema bereit.');
+  })
+  .catch(err => console.error('Paper-Trading: Schema-Initialisierung fehlgeschlagen:', err));
+
 app.listen(PORT, () => {
   console.log(`Jarvis-Server läuft auf http://localhost:${PORT}`);
   console.log(`Gemini konfiguriert: ${!!GEMINI_API_KEY} (Modell: ${GEMINI_MODEL})`);
   console.log(`MEXC konfiguriert: ${!!(MEXC_API_KEY && MEXC_API_SECRET)}`);
+  console.log(`Datenbank (Auto Trader) konfiguriert: ${!!DATABASE_URL}`);
 });
