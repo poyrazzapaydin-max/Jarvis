@@ -245,7 +245,10 @@ const PAPER_DEFAULT_SETTINGS = {
   watchedSymbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
   startCapitalEur: 100,
   maxOpenPositions: 3,
-  leverage: 5
+  leverage: 5,
+  criteriaTrendEnabled: true,
+  criteriaVolumeEnabled: false,
+  criteriaMtfEnabled: false
 };
 
 // In-Memory-Cache nur für zuletzt gesehene Live-Preise (rein informativ
@@ -325,6 +328,16 @@ async function initPaperTradingSchema() {
       generated_at TIMESTAMPTZ
     );
   `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS paper_check_log (
+      symbol TEXT PRIMARY KEY,
+      sweep_bos_found BOOLEAN NOT NULL DEFAULT false,
+      direction TEXT,
+      failed_criteria TEXT,
+      note TEXT,
+      checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
 
   // Migration für Spalten, die nachträglich (nach dem ersten Deploy) hinzukamen -
   // "CREATE TABLE IF NOT EXISTS" ergänzt bei bereits existierenden Tabellen
@@ -340,13 +353,16 @@ async function initPaperTradingSchema() {
   await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS criteria_volume BOOLEAN NOT NULL DEFAULT false');
   await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS criteria_mtf BOOLEAN NOT NULL DEFAULT false');
   await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gemini_reasoning TEXT');
+  await pgPool.query('ALTER TABLE paper_settings ADD COLUMN IF NOT EXISTS criteria_trend_enabled BOOLEAN NOT NULL DEFAULT true');
+  await pgPool.query('ALTER TABLE paper_settings ADD COLUMN IF NOT EXISTS criteria_volume_enabled BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE paper_settings ADD COLUMN IF NOT EXISTS criteria_mtf_enabled BOOLEAN NOT NULL DEFAULT false');
 
   const { rows } = await pgPool.query('SELECT id FROM paper_settings WHERE id = 1');
   if (!rows.length) {
     await pgPool.query(
-      `INSERT INTO paper_settings (id, enabled, risk_per_trade_eur, risk_reward_ratio, watched_symbols, start_capital_eur, balance_eur, leverage)
-       VALUES (1, false, $1, $2, $3, $4, $4, $5)`,
-      [PAPER_DEFAULT_SETTINGS.riskPerTradeEur, PAPER_DEFAULT_SETTINGS.riskRewardRatio, PAPER_DEFAULT_SETTINGS.watchedSymbols, PAPER_DEFAULT_SETTINGS.startCapitalEur, PAPER_DEFAULT_SETTINGS.leverage]
+      `INSERT INTO paper_settings (id, enabled, risk_per_trade_eur, risk_reward_ratio, watched_symbols, start_capital_eur, balance_eur, leverage, criteria_trend_enabled, criteria_volume_enabled, criteria_mtf_enabled)
+       VALUES (1, false, $1, $2, $3, $4, $4, $5, $6, $7, $8)`,
+      [PAPER_DEFAULT_SETTINGS.riskPerTradeEur, PAPER_DEFAULT_SETTINGS.riskRewardRatio, PAPER_DEFAULT_SETTINGS.watchedSymbols, PAPER_DEFAULT_SETTINGS.startCapitalEur, PAPER_DEFAULT_SETTINGS.leverage, PAPER_DEFAULT_SETTINGS.criteriaTrendEnabled, PAPER_DEFAULT_SETTINGS.criteriaVolumeEnabled, PAPER_DEFAULT_SETTINGS.criteriaMtfEnabled]
     );
     await pgPool.query('INSERT INTO paper_balance_history (balance) VALUES ($1)', [PAPER_DEFAULT_SETTINGS.startCapitalEur]);
   }
@@ -366,6 +382,9 @@ function rowToSettings(row) {
     balanceEur: Number(row.balance_eur),
     maxOpenPositions: Number(row.max_open_positions),
     leverage: Number(row.leverage),
+    criteriaTrendEnabled: row.criteria_trend_enabled,
+    criteriaVolumeEnabled: row.criteria_volume_enabled,
+    criteriaMtfEnabled: row.criteria_mtf_enabled,
     lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
   };
 }
@@ -446,7 +465,7 @@ function findLocalExtrema(candles, lookback = 4) {
 // Erkennt: Liquidation Sweep (Docht durchbricht ein vorheriges lokales
 // Hoch/Tief, Schlusskurs kehrt zurück) gefolgt von einem Break of
 // Structure (Schlusskurs durchbricht ein vorheriges lokales Hoch/Tief)
-// innerhalb eines Fensters von ~15 Kerzen, nahe (<=2%) der Sweep-Zone.
+// innerhalb eines Fensters von ~15 Kerzen, nahe (<=3%, gelockert von 2%) der Sweep-Zone.
 // Interpretation der "Support/Resistance-Nähe": die gesweepte Zone
 // selbst dient als Referenzlevel für die Abstandsprüfung.
 function detectPaperSetup(candles) {
@@ -477,7 +496,7 @@ function detectPaperSetup(candles) {
     const bos = upBos.find(b => b.index > sweep.index && b.index - sweep.index <= windowSize);
     if (bos) {
       const distancePct = Math.abs(candles[bos.index].close - sweep.sweptLevel) / sweep.sweptLevel * 100;
-      if (distancePct <= 2) {
+      if (distancePct <= 3) {
         return {
           direction: 'long',
           sweepExtreme: sweep.sweepExtreme,
@@ -511,7 +530,7 @@ function detectPaperSetup(candles) {
     const bos = downBos.find(b => b.index > sweep.index && b.index - sweep.index <= windowSize);
     if (bos) {
       const distancePct = Math.abs(candles[bos.index].close - sweep.sweptLevel) / sweep.sweptLevel * 100;
-      if (distancePct <= 2) {
+      if (distancePct <= 3) {
         return {
           direction: 'short',
           sweepExtreme: sweep.sweepExtreme,
@@ -542,15 +561,15 @@ function checkTrendFilter(candles1h, direction) {
 }
 
 // b) Volumen-Bestätigung: Volumen der BOS-Kerze (Bestätigungskerze) muss
-// mindestens das 1,5-fache des Durchschnittsvolumens der letzten 20 Kerzen
-// davor betragen.
+// mindestens das 1,2-fache des Durchschnittsvolumens der letzten 20 Kerzen
+// davor betragen (gelockert von ursprünglich 1,5x).
 function checkVolumeConfirmation(candles, confirmIndex) {
   const start = Math.max(0, confirmIndex - 20);
   const priorVolumes = candles.slice(start, confirmIndex).map(c => c.volume);
   if (!priorVolumes.length) return { pass: false, avgVolume: 0, confirmVolume: 0 };
   const avgVolume = priorVolumes.reduce((a, b) => a + b, 0) / priorVolumes.length;
   const confirmVolume = candles[confirmIndex].volume;
-  return { pass: avgVolume > 0 && confirmVolume >= avgVolume * 1.5, avgVolume, confirmVolume };
+  return { pass: avgVolume > 0 && confirmVolume >= avgVolume * 1.2, avgVolume, confirmVolume };
 }
 
 // c) Mehrere Zeitebenen: auf dem übergeordneten 1h-Chart darf keine
@@ -757,17 +776,45 @@ async function checkPaperSymbol(symbol, settings) {
   if (totalOpenRows[0].c >= settings.maxOpenPositions) return;
 
   const setup = detectPaperSetup(candles);
-  if (!setup) return;
 
-  // Punkt 1: Zusatzkriterien - alle drei müssen erfüllt sein, sonst wird das
-  // Setup gar nicht erst gewertet (kein Trade, kein Log unter "Übersprungen",
-  // da es die Basis-Erkennung per Definition nicht bestanden hat).
+  // Punkt 3 (Transparenz): pro Coin und Durchlauf einen Diagnose-Eintrag
+  // schreiben, der zeigt, ob überhaupt ein Sweep+BOS gefunden wurde und
+  // woran es ggf. gescheitert ist ("Letzte Prüfungen" auf der Auto-Trader-
+  // Seite). Ein Eintrag pro Symbol (Upsert), nicht pro Historie.
+  async function logCheck({ sweepBosFound, direction, failedCriteria, note }) {
+    await pgPool.query(
+      `INSERT INTO paper_check_log (symbol, sweep_bos_found, direction, failed_criteria, note, checked_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (symbol) DO UPDATE SET sweep_bos_found = $2, direction = $3, failed_criteria = $4, note = $5, checked_at = now()`,
+      [symbol, sweepBosFound, direction || null, failedCriteria || null, note || null]
+    );
+  }
+
+  if (!setup) {
+    await logCheck({ sweepBosFound: false, direction: null, failedCriteria: null, note: 'Kein Sweep+BOS in diesem Zeitraum.' });
+    return;
+  }
+
+  // Punkt 1: Zusatzkriterien sind pro Kriterium einzeln über die Einstellungen
+  // an-/abschaltbar. Ein deaktiviertes Kriterium blockiert nie (gilt als
+  // automatisch erfüllt), nur aktivierte Kriterien müssen tatsächlich passen.
   const candles1h = await fetchPaperCandles(symbol, '1h', 200);
   const trend = checkTrendFilter(candles1h, setup.direction);
   const volume = checkVolumeConfirmation(candles, setup.bosIndex);
   const mtf = checkMultiTimeframe(candles1h, setup.direction, lastPrice);
   const criteria = { trend, volume, mtf };
-  if (!trend.pass || !volume.pass || !mtf.pass) return;
+
+  const failed = [];
+  if (settings.criteriaTrendEnabled && !trend.pass) failed.push('Trendfilter');
+  if (settings.criteriaVolumeEnabled && !volume.pass) failed.push('Volumen-Bestätigung');
+  if (settings.criteriaMtfEnabled && !mtf.pass) failed.push('Mehrzeitebenen-Check');
+
+  if (failed.length) {
+    await logCheck({ sweepBosFound: true, direction: setup.direction, failedCriteria: failed.join(', '), note: `Sweep+BOS gefunden, aber ${failed.join(', ')} nicht erfüllt.` });
+    return;
+  }
+
+  await logCheck({ sweepBosFound: true, direction: setup.direction, failedCriteria: null, note: 'Sweep+BOS gefunden, alle aktivierten Zusatzkriterien erfüllt - an Gemini zur Prüfung geschickt.' });
 
   // Punkt 2: Gemini als Gegencheck, bevor der Trade wirklich eröffnet wird.
   const closes5m = candles.map(c => c.close);
@@ -847,6 +894,7 @@ app.get('/api/paper-trading/state', async (req, res) => {
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM paper_balance_history ORDER BY time ASC');
     const { rows: skippedRows } = await pgPool.query('SELECT * FROM paper_skipped_setups ORDER BY created_at DESC LIMIT 50');
     const { rows: insightRows } = await pgPool.query('SELECT trade_count, insight_text, generated_at FROM paper_insights WHERE id = 1');
+    const { rows: checkLogRows } = await pgPool.query('SELECT * FROM paper_check_log ORDER BY checked_at DESC');
 
     const openTrades = openRows.map(rowToTrade).map(t => {
       const currentPrice = paperLastPrices[t.symbol] ?? null;
@@ -866,8 +914,16 @@ app.get('/api/paper-trading/state', async (req, res) => {
       text: insightRows[0].insight_text,
       generatedAt: insightRows[0].generated_at ? new Date(insightRows[0].generated_at).getTime() : null
     } : null;
+    const checkLog = checkLogRows.map(r => ({
+      symbol: r.symbol,
+      sweepBosFound: r.sweep_bos_found,
+      direction: r.direction,
+      failedCriteria: r.failed_criteria,
+      note: r.note,
+      checkedAt: new Date(r.checked_at).getTime()
+    }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, insights, lastCheck: settings.lastCheck });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, insights, checkLog, lastCheck: settings.lastCheck });
   } catch (err) {
     console.error('Paper-Trading: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -887,11 +943,14 @@ app.post('/api/paper-trading/settings', async (req, res) => {
       watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols,
       startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
       maxOpenPositions: Number(incoming.maxOpenPositions) > 0 ? Number(incoming.maxOpenPositions) : current.maxOpenPositions,
-      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage
+      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
+      criteriaTrendEnabled: incoming.criteriaTrendEnabled !== undefined ? !!incoming.criteriaTrendEnabled : current.criteriaTrendEnabled,
+      criteriaVolumeEnabled: incoming.criteriaVolumeEnabled !== undefined ? !!incoming.criteriaVolumeEnabled : current.criteriaVolumeEnabled,
+      criteriaMtfEnabled: incoming.criteriaMtfEnabled !== undefined ? !!incoming.criteriaMtfEnabled : current.criteriaMtfEnabled
     };
     await pgPool.query(
-      `UPDATE paper_settings SET enabled = $1, risk_per_trade_eur = $2, risk_reward_ratio = $3, watched_symbols = $4, start_capital_eur = $5, max_open_positions = $6, leverage = $7 WHERE id = 1`,
-      [next.enabled, next.riskPerTradeEur, next.riskRewardRatio, next.watchedSymbols, next.startCapitalEur, next.maxOpenPositions, next.leverage]
+      `UPDATE paper_settings SET enabled = $1, risk_per_trade_eur = $2, risk_reward_ratio = $3, watched_symbols = $4, start_capital_eur = $5, max_open_positions = $6, leverage = $7, criteria_trend_enabled = $8, criteria_volume_enabled = $9, criteria_mtf_enabled = $10 WHERE id = 1`,
+      [next.enabled, next.riskPerTradeEur, next.riskRewardRatio, next.watchedSymbols, next.startCapitalEur, next.maxOpenPositions, next.leverage, next.criteriaTrendEnabled, next.criteriaVolumeEnabled, next.criteriaMtfEnabled]
     );
 
     if (next.enabled && !wasEnabled) runPaperTradingCycle();
@@ -908,7 +967,10 @@ app.post('/api/paper-trading/reset', async (req, res) => {
     const settings = await getPaperSettings();
     await pgPool.query('DELETE FROM paper_trades');
     await pgPool.query('DELETE FROM paper_balance_history');
+    await pgPool.query('DELETE FROM paper_skipped_setups');
+    await pgPool.query('DELETE FROM paper_check_log');
     await pgPool.query('UPDATE paper_settings SET balance_eur = $1, last_check = NULL WHERE id = 1', [settings.startCapitalEur]);
+    await pgPool.query('UPDATE paper_insights SET trade_count = 0, insight_text = NULL, generated_at = NULL WHERE id = 1');
     await pgPool.query('INSERT INTO paper_balance_history (balance) VALUES ($1)', [settings.startCapitalEur]);
     Object.keys(paperLastPrices).forEach(k => delete paperLastPrices[k]);
     res.json({ ok: true });

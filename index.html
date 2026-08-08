@@ -3095,6 +3095,82 @@
     line-height: 1.4;
   }
 
+  .at-criteria-toggles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin-bottom: 4px;
+  }
+
+  .at-criteria-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+
+  .at-criteria-toggle input {
+    accent-color: var(--cyan);
+    width: 15px;
+    height: 15px;
+    cursor: pointer;
+  }
+
+  .at-check-log {
+    display: flex;
+    flex-direction: column;
+    max-height: 320px;
+    overflow-y: auto;
+    gap: 8px;
+  }
+
+  .at-check-row {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 8px 4px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-size: 0.76rem;
+  }
+
+  .at-check-row:last-child { border-bottom: none; }
+
+  .at-check-row-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .at-check-sym {
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .at-check-status {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.62rem;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid;
+  }
+
+  .at-check-status.none { color: var(--text-dim); border-color: var(--border); background: rgba(255,255,255,0.03); }
+  .at-check-status.blocked { color: #ffcf7a; border-color: rgba(255,207,122,0.4); background: rgba(255,207,122,0.08); }
+  .at-check-status.passed { color: #7CFFC4; border-color: rgba(52,226,154,0.4); background: rgba(52,226,154,0.08); }
+
+  .at-check-note {
+    color: var(--text-dim);
+    font-size: 0.72rem;
+  }
+
+  .at-check-time {
+    color: var(--text-dim);
+    font-size: 0.68rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
   .trade-liq-warning {
     font-size: 0.68rem;
     color: #ffb0bc;
@@ -3495,6 +3571,12 @@
               <label>Max. offene Positionen<input type="number" step="1" min="1" max="10" class="select-input" id="atMaxPositions"></label>
               <label>Hebel (1x - 10x)<input type="number" step="1" min="1" max="10" class="select-input" id="atLeverage"></label>
             </div>
+            <div class="panel-title" style="margin-top:14px;">ZUSATZ-KRITERIEN <span class="card-title-hint">— einzeln an-/abschaltbar</span></div>
+            <div class="at-criteria-toggles">
+              <label class="at-criteria-toggle"><input type="checkbox" id="atCritTrend"> Trendfilter (SMA200/50, 1h)</label>
+              <label class="at-criteria-toggle"><input type="checkbox" id="atCritVolume"> Volumen-Bestätigung (≥1,2x Ø)</label>
+              <label class="at-criteria-toggle"><input type="checkbox" id="atCritMtf"> Mehrzeitebenen-Check (1h)</label>
+            </div>
             <div class="panel-title" style="margin-top:14px;">BEOBACHTETE COINS</div>
             <div class="at-coin-select" id="atCoinSelect"></div>
             <div class="quick-action-row" style="margin-top:14px;">
@@ -3532,6 +3614,11 @@
           <div class="panel-card">
             <div class="panel-title">ÜBERSPRUNGENE SETUPS <span class="card-title-hint">— technisch erkannt, von Gemini abgelehnt</span></div>
             <div class="trade-list" id="atSkippedList"><div class="notes-empty">Noch keine übersprungenen Setups.</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">LETZTE PRÜFUNGEN <span class="card-title-hint">— was der Bot pro Coin gerade sieht</span></div>
+            <div class="at-check-log" id="atCheckLog"><div class="notes-empty">Noch keine Prüfungen protokolliert.</div></div>
           </div>
 
           <div class="panel-card">
@@ -4122,6 +4209,20 @@
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT',
     'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT',
     'TAOUSDT', 'ZECUSDT'
+  ];
+
+  // Erweiterte Coin-Auswahl NUR für den Auto Trader (mehr Chancen auf
+  // gleichzeitige Setups) - bewusst getrennt von BINANCE_SYMBOLS, damit die
+  // Haupt-Watchlist auf der Trading-Seite unverändert bleibt. Grobe Auswahl
+  // der nach Volumen wichtigsten Binance-USDT-Perp-Paare.
+  const AUTO_TRADER_SYMBOLS = [
+    'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT',
+    'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT',
+    'TAOUSDT', 'ZECUSDT', 'TRXUSDT', 'TONUSDT', 'SHIBUSDT',
+    'LTCUSDT', 'BCHUSDT', 'NEARUSDT', 'UNIUSDT', 'APTUSDT',
+    'ICPUSDT', 'ETCUSDT', 'ATOMUSDT', 'FILUSDT', 'ARBUSDT',
+    'OPUSDT', 'SUIUSDT', 'INJUSDT', 'RENDERUSDT', 'HBARUSDT',
+    'VETUSDT', 'FTMUSDT', 'ALGOUSDT', 'SEIUSDT', 'AAVEUSDT'
   ];
 
   const feedList = document.getElementById('feedList');
@@ -6715,7 +6816,7 @@
   let atSelectedSymbols = [];
 
   function atCoinChipsHtml() {
-    return BINANCE_SYMBOLS.map(sym => {
+    return AUTO_TRADER_SYMBOLS.map(sym => {
       const active = atSelectedSymbols.includes(sym);
       return `<span class="at-coin-chip${active ? ' active' : ''}" data-sym="${sym}">${sym.replace('USDT', '/USDT')}</span>`;
     }).join('');
@@ -6761,6 +6862,22 @@
       <div class="trade-row-bottom">
         <span class="trade-time mono">${time} · ${escapeHtml(s.reason || '')}</span>
       </div>
+    </div>`;
+  }
+
+  function atCheckRowHtml(c) {
+    const time = new Date(c.checkedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+    let statusClass = 'none', statusLabel = 'KEIN SETUP';
+    if (c.sweepBosFound && c.failedCriteria) { statusClass = 'blocked'; statusLabel = 'BLOCKIERT'; }
+    else if (c.sweepBosFound && !c.failedCriteria) { statusClass = 'passed'; statusLabel = 'DURCHGELASSEN'; }
+    const dirText = c.direction ? ` (${c.direction === 'long' ? 'LONG' : 'SHORT'})` : '';
+    return `<div class="at-check-row">
+      <div class="at-check-row-top">
+        <span class="at-check-sym">${escapeHtml(c.symbol.replace('USDT', '/USDT'))}${dirText}</span>
+        <span class="at-check-status ${statusClass}">${statusLabel}</span>
+      </div>
+      <div class="at-check-note">${escapeHtml(c.note || '')}</div>
+      <div class="at-check-time">${time}</div>
     </div>`;
   }
 
@@ -6871,6 +6988,9 @@
       document.getElementById('atStartCapital').value = data.settings.startCapitalEur;
       document.getElementById('atMaxPositions').value = data.settings.maxOpenPositions;
       document.getElementById('atLeverage').value = data.settings.leverage;
+      document.getElementById('atCritTrend').checked = !!data.settings.criteriaTrendEnabled;
+      document.getElementById('atCritVolume').checked = !!data.settings.criteriaVolumeEnabled;
+      document.getElementById('atCritMtf').checked = !!data.settings.criteriaMtfEnabled;
 
       const toggleBtn = document.getElementById('atEnableToggle');
       toggleBtn.classList.toggle('on', data.settings.enabled);
@@ -6918,6 +7038,14 @@
           : '<div class="notes-empty">Noch keine übersprungenen Setups.</div>';
       }
 
+      const checkLogEl = document.getElementById('atCheckLog');
+      if (checkLogEl) {
+        const log = data.checkLog || [];
+        checkLogEl.innerHTML = log.length
+          ? log.map(atCheckRowHtml).join('')
+          : '<div class="notes-empty">Noch keine Prüfungen protokolliert.</div>';
+      }
+
       const insightsTextEl = document.getElementById('atInsightsText');
       const insightsMetaEl = document.getElementById('atInsightsMeta');
       if (insightsTextEl) {
@@ -6948,6 +7076,9 @@
       startCapitalEur: parseFloat(document.getElementById('atStartCapital').value),
       maxOpenPositions: parseInt(document.getElementById('atMaxPositions').value, 10),
       leverage: parseInt(document.getElementById('atLeverage').value, 10),
+      criteriaTrendEnabled: document.getElementById('atCritTrend').checked,
+      criteriaVolumeEnabled: document.getElementById('atCritVolume').checked,
+      criteriaMtfEnabled: document.getElementById('atCritMtf').checked,
       watchedSymbols: atSelectedSymbols
     };
     await fetch('/api/paper-trading/settings', {
