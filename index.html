@@ -4448,11 +4448,11 @@
   const AUTO_TRADER_SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT',
     'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT',
-    'TAOUSDT', 'ZECUSDT', 'TRXUSDT', 'TONUSDT', 'SHIBUSDT',
+    'TAOUSDT', 'ZECUSDT', 'TRXUSDT', 'SHIBUSDT',
     'LTCUSDT', 'BCHUSDT', 'NEARUSDT', 'UNIUSDT', 'APTUSDT',
     'ICPUSDT', 'ETCUSDT', 'ATOMUSDT', 'FILUSDT', 'ARBUSDT',
     'OPUSDT', 'SUIUSDT', 'INJUSDT', 'RENDERUSDT', 'HBARUSDT',
-    'VETUSDT', 'FTMUSDT', 'ALGOUSDT', 'SEIUSDT', 'AAVEUSDT'
+    'VETUSDT', 'ALGOUSDT', 'SEIUSDT', 'AAVEUSDT'
   ];
 
   const feedList = document.getElementById('feedList');
@@ -7083,6 +7083,9 @@
         .then(r => r.json())
         .then(res => {
           if (res.error) { alert(res.error); btn.disabled = false; return; }
+          if (res.usedLastKnownPrice) {
+            alert(`Hinweis: Live-Kurs für ${trade.symbol} nicht abrufbar - Trade wurde mit dem letzten bekannten Preis (${res.exitPrice}) geschlossen, nicht dem allerneuesten Kurs.`);
+          }
           addFeedEntry(`Auto-Trader-Trade ${trade.symbol} manuell geschlossen`);
           loadAutoTraderState();
         })
@@ -7532,6 +7535,9 @@
         .then(r => r.json())
         .then(res => {
           if (res.error) { alert(res.error); btn.disabled = false; return; }
+          if (res.usedLastKnownPrice) {
+            alert(`Hinweis: Live-Kurs für ${trade.symbol} nicht abrufbar - Trade wurde mit dem letzten bekannten Preis (${res.exitPrice}) geschlossen, nicht dem allerneuesten Kurs.`);
+          }
           addFeedEntry(`NY-Range-Bot-Trade ${trade.symbol} manuell geschlossen`);
           loadNyBotState();
         })

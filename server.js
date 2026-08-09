@@ -245,11 +245,11 @@ const PAPER_DEFAULT_SETTINGS = {
   watchedSymbols: [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT',
     'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT',
-    'TAOUSDT', 'ZECUSDT', 'TRXUSDT', 'TONUSDT', 'SHIBUSDT',
+    'TAOUSDT', 'ZECUSDT', 'TRXUSDT', 'SHIBUSDT',
     'LTCUSDT', 'BCHUSDT', 'NEARUSDT', 'UNIUSDT', 'APTUSDT',
     'ICPUSDT', 'ETCUSDT', 'ATOMUSDT', 'FILUSDT', 'ARBUSDT',
     'OPUSDT', 'SUIUSDT', 'INJUSDT', 'RENDERUSDT', 'HBARUSDT',
-    'VETUSDT', 'FTMUSDT', 'ALGOUSDT', 'SEIUSDT', 'AAVEUSDT'
+    'VETUSDT', 'ALGOUSDT', 'SEIUSDT', 'AAVEUSDT'
   ],
   startCapitalEur: 100,
   maxOpenPositions: 3,
@@ -843,6 +843,7 @@ async function runPaperTradingCycle() {
     } catch (err) {
       console.error(`Paper-Trading-Fehler bei ${symbol}:`, err.message || err);
     }
+    await sleep(150); // entzerrt die Binance-Anfragen etwas, statt sie im Burst zu feuern
   }
   await pgPool.query('UPDATE paper_settings SET last_check = now() WHERE id = 1');
 }
@@ -948,11 +949,26 @@ app.post('/api/paper-trading/reset', async (req, res) => {
 // NUR SIMULATION - schließt einen einzelnen offenen Paper-Trade manuell zum
 // aktuellen Marktpreis (holt den Preis live von Binance, kein SL/TP-Wert).
 // Löst keine echte Order aus, verändert nur die lokale Simulation.
-async function fetchLiveTickerPrice(symbol) {
-  const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
-  if (!res.ok) throw new Error(`Ticker-Fehler für ${symbol}: HTTP ${res.status}`);
-  const data = await res.json();
-  return Number(data.price);
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+// Holt den aktuellen Preis mit 3 Versuchen (kurze Wartezeit dazwischen), um
+// vorübergehende Binance-Rate-Limits (HTTP 418/429) abzufedern. Wirft erst,
+// wenn alle Versuche fehlschlagen - der Aufrufer entscheidet dann über
+// einen Fallback auf den letzten bekannten Preis.
+async function fetchLiveTickerPriceWithRetry(symbol, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
+      if (!res.ok) throw new Error(`Ticker-Fehler für ${symbol}: HTTP ${res.status}`);
+      const data = await res.json();
+      return Number(data.price);
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) await sleep(400 * (i + 1)); // steigende Wartezeit: 400ms, 800ms
+    }
+  }
+  throw lastErr;
 }
 
 app.post('/api/paper-trading/close/:id', async (req, res) => {
@@ -962,7 +978,22 @@ app.post('/api/paper-trading/close/:id', async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Offener Trade nicht gefunden.' });
     const trade = rowToTrade(rows[0]);
 
-    const exitPrice = await fetchLiveTickerPrice(trade.symbol);
+    // Fallback: falls der Live-Kurs trotz mehrerer Versuche nicht abrufbar ist
+    // (Rate-Limit oder pausiertes Handelspaar), wird der letzte bekannte
+    // Kurs aus dem Hintergrund-Zyklus verwendet, statt den Trade blockiert
+    // zu lassen. Wird dem Frontend klar als "usedLastKnownPrice" markiert.
+    let exitPrice, usedLastKnownPrice = false;
+    try {
+      exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol);
+    } catch (err) {
+      const cached = paperLastPrices[trade.symbol];
+      if (cached == null) {
+        return res.status(503).json({ error: `Aktueller Kurs für ${trade.symbol} nicht abrufbar (${err.message}) und kein zwischengespeicherter Preis vorhanden. Bitte später erneut versuchen.` });
+      }
+      exitPrice = cached;
+      usedLastKnownPrice = true;
+    }
+
     const pnlEur = trade.direction === 'long'
       ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
       : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
@@ -983,7 +1014,7 @@ app.post('/api/paper-trading/close/:id', async (req, res) => {
       generatePaperInsights(closedCount).catch(err => console.error('Auto Trader: Insight-Generierung fehlgeschlagen:', err.message || err));
     }
 
-    res.json({ ok: true, exitPrice, pnlEur });
+    res.json({ ok: true, exitPrice, pnlEur, usedLastKnownPrice });
   } catch (err) {
     console.error('Paper-Trading: manuelles Schließen fehlgeschlagen:', err);
     res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
@@ -1319,6 +1350,7 @@ async function runNyTradingCycle() {
     } catch (err) {
       console.error(`NY-Range-Bot-Fehler bei ${symbol}:`, err.message || err);
     }
+    await sleep(150); // entzerrt die Binance-Anfragen etwas, statt sie im Burst zu feuern
   }
   await pgPool.query('UPDATE ny_settings SET last_check = now() WHERE id = 1');
 }
@@ -1409,7 +1441,18 @@ app.post('/api/ny-trading/close/:id', async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Offener Trade nicht gefunden.' });
     const trade = nyRowToTrade(rows[0]);
 
-    const exitPrice = await fetchLiveTickerPrice(trade.symbol);
+    let exitPrice, usedLastKnownPrice = false;
+    try {
+      exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol);
+    } catch (err) {
+      const cached = nyLastPrices[trade.symbol];
+      if (cached == null) {
+        return res.status(503).json({ error: `Aktueller Kurs für ${trade.symbol} nicht abrufbar (${err.message}) und kein zwischengespeicherter Preis vorhanden. Bitte später erneut versuchen.` });
+      }
+      exitPrice = cached;
+      usedLastKnownPrice = true;
+    }
+
     const pnlEur = trade.direction === 'long'
       ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
       : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
@@ -1424,7 +1467,7 @@ app.post('/api/ny-trading/close/:id', async (req, res) => {
     );
     await pgPool.query('INSERT INTO ny_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
 
-    res.json({ ok: true, exitPrice, pnlEur });
+    res.json({ ok: true, exitPrice, pnlEur, usedLastKnownPrice });
   } catch (err) {
     console.error('NY Range Bot: manuelles Schließen fehlgeschlagen:', err);
     res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
