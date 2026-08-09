@@ -3249,6 +3249,40 @@
   .pnl-color-up { color: var(--green); }
   .pnl-color-down { color: var(--red); }
 
+  .at-trade-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 6px;
+  }
+
+  .at-trade-action-btn {
+    flex: 1;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.7rem;
+    padding: 6px 10px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: rgba(56,226,255,0.05);
+    color: var(--text);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .at-trade-action-btn:hover {
+    border-color: rgba(56,226,255,0.4);
+    background: rgba(56,226,255,0.09);
+  }
+
+  .at-trade-action-btn.danger {
+    border-color: rgba(255,92,114,0.3);
+    color: #ffb0bc;
+  }
+
+  .at-trade-action-btn.danger:hover {
+    background: rgba(255,92,114,0.08);
+    border-color: rgba(255,92,114,0.5);
+  }
+
   .trade-pnl-big {
     font-size: 1.25rem;
     font-weight: 700;
@@ -6305,6 +6339,7 @@
       ensureChart();
       candleSeries.setData(candles);
       lwChart.timeScale().fitContent();
+      applyChartPriceLines();
 
       const last = candles[candles.length - 1];
       if (last) chartPriceEl.textContent = '$' + formatPrice(last.close);
@@ -6316,8 +6351,30 @@
     }
   }
 
-  function openChart(symbol, displayName) {
+  let currentChartLevels = null;
+  let chartPriceLineRefs = [];
+
+  function clearChartPriceLines() {
+    if (!candleSeries) return;
+    chartPriceLineRefs.forEach(ref => { try { candleSeries.removePriceLine(ref); } catch (err) { /* Serie evtl. neu erstellt */ } });
+    chartPriceLineRefs = [];
+  }
+
+  function applyChartPriceLines() {
+    if (!candleSeries) return;
+    clearChartPriceLines();
+    if (!currentChartLevels) return;
+    const { entry, sl, tp } = currentChartLevels;
+    if (entry != null) chartPriceLineRefs.push(candleSeries.createPriceLine({ price: entry, color: '#38e2ff', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'Einstieg' }));
+    if (sl != null) chartPriceLineRefs.push(candleSeries.createPriceLine({ price: sl, color: '#ff5c72', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'SL' }));
+    if (tp != null) chartPriceLineRefs.push(candleSeries.createPriceLine({ price: tp, color: '#34e29a', lineWidth: 1, lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: 'TP' }));
+  }
+
+  // levels (optional): { entry, sl, tp } - zeichnet horizontale Linien für
+  // offene Bot-Trades ein, damit der Trade relativ zum Kursverlauf sichtbar ist.
+  function openChart(symbol, displayName, levels) {
     currentChartSymbol = symbol;
+    currentChartLevels = levels || null;
     chartSymbolEl.textContent = displayName;
     chartOverlay.classList.add('open');
     loadCandles(symbol, currentInterval);
@@ -7010,6 +7067,28 @@
   // wiederum nur öffentliche Binance-Kursdaten liest. Es gibt hier keinen
   // Aufruf, der eine echte MEXC-Order auslösen könnte.
   let atSelectedSymbols = [];
+  let atLastOpenTrades = [];
+
+  document.getElementById('atOpenList').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const trade = atLastOpenTrades.find(t => t.id === btn.dataset.id);
+    if (!trade) return;
+    if (btn.dataset.action === 'chart') {
+      openChart(trade.symbol, trade.symbol.replace('USDT', '/USDT'), { entry: trade.entryPrice, sl: trade.stopLoss, tp: trade.takeProfit });
+    } else if (btn.dataset.action === 'close') {
+      if (!confirm(`${trade.symbol.replace('USDT', '/USDT')}-Trade wirklich schließen? Wird zum aktuellen Marktpreis abgerechnet.`)) return;
+      btn.disabled = true;
+      fetch(`/api/paper-trading/close/${trade.id}`, { method: 'POST' })
+        .then(r => r.json())
+        .then(res => {
+          if (res.error) { alert(res.error); btn.disabled = false; return; }
+          addFeedEntry(`Auto-Trader-Trade ${trade.symbol} manuell geschlossen`);
+          loadAutoTraderState();
+        })
+        .catch(() => { btn.disabled = false; });
+    }
+  });
 
   function atCoinChipsHtml() {
     return AUTO_TRADER_SYMBOLS.map(sym => {
@@ -7072,6 +7151,10 @@
 
   function pnlColorClass(value) {
     return value >= 0 ? 'pnl-color-up' : 'pnl-color-down';
+  }
+
+  function closeReasonLabel(code) {
+    return { TP: 'Take-Profit', SL: 'Stop-Loss', LIQUIDATION: 'Liquidation', MANUAL: 'Manuell geschlossen' }[code] || code;
   }
 
   function atSkippedRowHtml(s) {
@@ -7144,7 +7227,7 @@
         ]
       : [
           ['Einstieg → Exit', `${formatAutoPrice(t.entryPrice)} → ${formatAutoPrice(t.exitPrice)}`],
-          ['Grund', t.closeReason],
+          ['Grund', closeReasonLabel(t.closeReason)],
           ['Stop-Loss', formatAutoPrice(t.stopLoss)],
           ['Take-Profit', formatAutoPrice(t.takeProfit)],
           ['Liquidation', t.liquidationPrice != null ? formatAutoPrice(t.liquidationPrice) : '--'],
@@ -7155,6 +7238,13 @@
         <span class="at-trade-grid-label">${escapeHtml(label)}</span>
         <span class="at-trade-grid-value">${escapeHtml(String(value))}</span>
       </div>`).join('');
+
+    const actions = isOpen
+      ? `<div class="at-trade-actions">
+          <button class="at-trade-action-btn" data-action="chart" data-id="${t.id}">📈 Chart</button>
+          <button class="at-trade-action-btn danger" data-action="close" data-id="${t.id}">✕ Trade schließen</button>
+        </div>`
+      : '';
 
     return `<div class="trade-row">
       <div class="trade-row-top">
@@ -7172,6 +7262,7 @@
         <span class="trade-time mono">${time}</span>
         <span class="trade-pnl-big mono ${pnlColorCls}">${pnlText}</span>
       </div>
+      ${actions}
       <details class="at-trade-details">
         <summary>Details (Erkennungsgrund)</summary>
         <div class="at-trade-details-text">${escapeHtml(t.reason || '')}</div>
@@ -7274,6 +7365,7 @@
 
       const openEl = document.getElementById('atOpenList');
       const openTrades = data.openTrades || [];
+      atLastOpenTrades = openTrades;
       openEl.innerHTML = openTrades.length
         ? openTrades.map(t => atTradeRowHtml(t, true)).join('')
         : '<div class="notes-empty">Keine offenen Positionen.</div>';
@@ -7424,6 +7516,28 @@
   // öffentliche Binance-Kursdaten liest. Kein Aufruf hier kann eine echte
   // MEXC-Order auslösen.
   let nySelectedSymbols = [];
+  let nyLastOpenTrades = [];
+
+  document.getElementById('nyOpenList').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const trade = nyLastOpenTrades.find(t => t.id === btn.dataset.id);
+    if (!trade) return;
+    if (btn.dataset.action === 'chart') {
+      openChart(trade.symbol, trade.symbol.replace('USDT', '/USDT'), { entry: trade.entryPrice, sl: trade.stopLoss, tp: trade.takeProfit });
+    } else if (btn.dataset.action === 'close') {
+      if (!confirm(`${trade.symbol.replace('USDT', '/USDT')}-Trade wirklich schließen? Wird zum aktuellen Marktpreis abgerechnet.`)) return;
+      btn.disabled = true;
+      fetch(`/api/ny-trading/close/${trade.id}`, { method: 'POST' })
+        .then(r => r.json())
+        .then(res => {
+          if (res.error) { alert(res.error); btn.disabled = false; return; }
+          addFeedEntry(`NY-Range-Bot-Trade ${trade.symbol} manuell geschlossen`);
+          loadNyBotState();
+        })
+        .catch(() => { btn.disabled = false; });
+    }
+  });
 
   function nyCoinChipsHtml() {
     return AUTO_TRADER_SYMBOLS.map(sym => {
@@ -7490,12 +7604,19 @@
       ['Margin', `${t.marginEur.toFixed(2)}€`],
       ['Positionsgröße', `${t.positionSizeEur.toFixed(2)}€`]
     ];
-    if (!isOpen) gridItems.push(['Grund', t.closeReason]);
+    if (!isOpen) gridItems.push(['Grund', closeReasonLabel(t.closeReason)]);
     const gridHtml = gridItems.map(([label, value]) => `
       <div class="at-trade-grid-item">
         <span class="at-trade-grid-label">${escapeHtml(label)}</span>
         <span class="at-trade-grid-value">${escapeHtml(String(value))}</span>
       </div>`).join('');
+
+    const actions = isOpen
+      ? `<div class="at-trade-actions">
+          <button class="at-trade-action-btn" data-action="chart" data-id="${t.id}">📈 Chart</button>
+          <button class="at-trade-action-btn danger" data-action="close" data-id="${t.id}">✕ Trade schließen</button>
+        </div>`
+      : '';
 
     return `<div class="trade-row">
       <div class="trade-row-top">
@@ -7509,6 +7630,7 @@
         <span class="trade-time mono">${time}</span>
         <span class="trade-pnl-big mono ${pnlColorCls}">${pnlText}</span>
       </div>
+      ${actions}
       <details class="at-trade-details">
         <summary>Details (Erkennungsgrund)</summary>
         <div class="at-trade-details-text">${escapeHtml(t.reason || '')}</div>
@@ -7606,6 +7728,7 @@
 
       const openEl = document.getElementById('nyOpenList');
       const openTrades = data.openTrades || [];
+      nyLastOpenTrades = openTrades;
       openEl.innerHTML = openTrades.length
         ? openTrades.map(t => nyTradeRowHtml(t, true)).join('')
         : '<div class="notes-empty">Keine offenen Positionen.</div>';

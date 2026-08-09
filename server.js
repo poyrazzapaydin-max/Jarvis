@@ -945,6 +945,51 @@ app.post('/api/paper-trading/reset', async (req, res) => {
   }
 });
 
+// NUR SIMULATION - schließt einen einzelnen offenen Paper-Trade manuell zum
+// aktuellen Marktpreis (holt den Preis live von Binance, kein SL/TP-Wert).
+// Löst keine echte Order aus, verändert nur die lokale Simulation.
+async function fetchLiveTickerPrice(symbol) {
+  const res = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
+  if (!res.ok) throw new Error(`Ticker-Fehler für ${symbol}: HTTP ${res.status}`);
+  const data = await res.json();
+  return Number(data.price);
+}
+
+app.post('/api/paper-trading/close/:id', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Auto Trader nicht verfügbar.' });
+  try {
+    const { rows } = await pgPool.query("SELECT * FROM paper_trades WHERE id = $1 AND status = 'open'", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Offener Trade nicht gefunden.' });
+    const trade = rowToTrade(rows[0]);
+
+    const exitPrice = await fetchLiveTickerPrice(trade.symbol);
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+
+    await pgPool.query(
+      `UPDATE paper_trades SET status = 'closed', exit_price = $1, close_reason = 'MANUAL', pnl_eur = $2, closed_at = now() WHERE id = $3`,
+      [exitPrice, pnlEur, trade.id]
+    );
+    const { rows: balRows } = await pgPool.query(
+      'UPDATE paper_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur',
+      [pnlEur]
+    );
+    await pgPool.query('INSERT INTO paper_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+
+    const { rows: closedCountRows } = await pgPool.query("SELECT COUNT(*)::int AS c FROM paper_trades WHERE status = 'closed'");
+    const closedCount = closedCountRows[0].c;
+    if (closedCount > 0 && closedCount % 20 === 0) {
+      generatePaperInsights(closedCount).catch(err => console.error('Auto Trader: Insight-Generierung fehlgeschlagen:', err.message || err));
+    }
+
+    res.json({ ok: true, exitPrice, pnlEur });
+  } catch (err) {
+    console.error('Paper-Trading: manuelles Schließen fehlgeschlagen:', err);
+    res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
+  }
+});
+
 // ============================================================
 // NY RANGE BOT - zweiter, komplett unabhängiger Paper-Trading-Bot
 // (eigene Strategie, eigener Kapitalschutz, eigene DB-Tabellen "ny_*").
@@ -1352,6 +1397,37 @@ app.post('/api/ny-trading/reset', async (req, res) => {
   } catch (err) {
     console.error('NY Range Bot: reset-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+// NUR SIMULATION - schließt einen einzelnen offenen NY-Range-Bot-Trade
+// manuell zum aktuellen Marktpreis. Löst keine echte Order aus.
+app.post('/api/ny-trading/close/:id', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - NY Range Bot nicht verfügbar.' });
+  try {
+    const { rows } = await pgPool.query("SELECT * FROM ny_trades WHERE id = $1 AND status = 'open'", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Offener Trade nicht gefunden.' });
+    const trade = nyRowToTrade(rows[0]);
+
+    const exitPrice = await fetchLiveTickerPrice(trade.symbol);
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+
+    await pgPool.query(
+      `UPDATE ny_trades SET status = 'closed', exit_price = $1, close_reason = 'MANUAL', pnl_eur = $2, closed_at = now() WHERE id = $3`,
+      [exitPrice, pnlEur, trade.id]
+    );
+    const { rows: balRows } = await pgPool.query(
+      'UPDATE ny_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur',
+      [pnlEur]
+    );
+    await pgPool.query('INSERT INTO ny_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+
+    res.json({ ok: true, exitPrice, pnlEur });
+  } catch (err) {
+    console.error('NY Range Bot: manuelles Schließen fehlgeschlagen:', err);
+    res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
   }
 });
 
