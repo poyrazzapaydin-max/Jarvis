@@ -364,6 +364,15 @@ async function initPaperTradingSchema() {
   await pgPool.query('ALTER TABLE paper_settings ADD COLUMN IF NOT EXISTS criteria_trend_enabled BOOLEAN NOT NULL DEFAULT true');
   await pgPool.query('ALTER TABLE paper_settings ADD COLUMN IF NOT EXISTS criteria_volume_enabled BOOLEAN NOT NULL DEFAULT false');
   await pgPool.query('ALTER TABLE paper_settings ADD COLUMN IF NOT EXISTS criteria_mtf_enabled BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS flagged_buggy BOOLEAN NOT NULL DEFAULT false');
+
+  // Einmalige Kennzeichnung des bekannten Bugs (unbegrenzte Margin bei sehr
+  // engem SL-Abstand, z.B. der ATOM-Trade mit 9.452€ Margin bei 100€
+  // Start-Kapital) - identifiziert per Heuristik (Margin deutlich über jedem
+  // realistischen Wert), rein informativ, ändert die Trade-Daten nicht.
+  await pgPool.query(
+    "UPDATE paper_trades SET flagged_buggy = true WHERE margin_eur > 1000 AND flagged_buggy = false"
+  );
 
   const { rows } = await pgPool.query('SELECT id FROM paper_settings WHERE id = 1');
   if (!rows.length) {
@@ -420,6 +429,7 @@ function rowToTrade(row) {
     criteriaVolume: row.criteria_volume,
     criteriaMtf: row.criteria_mtf,
     geminiReasoning: row.gemini_reasoning,
+    flaggedBuggy: row.flagged_buggy,
     reason: row.reason,
     openedAt: new Date(row.opened_at).getTime(),
     exitPrice: row.exit_price != null ? Number(row.exit_price) : null,
@@ -595,22 +605,22 @@ function checkMultiTimeframe(candles1h, direction, currentPrice) {
   }
 }
 
-// Hebel-Berechnung (siehe Erklärung im Chat für die Herleitung):
-// - Der Stop-Loss bleibt am technischen Sweep-Level (unverändert durch Hebel).
-// - Positionsgröße (Nominalwert) = Max. Risiko€ * Hebel / prozentualer SL-Abstand,
-//   d.h. bei höherem Hebel wird für dasselbe Margin-Kapital eine größere
-//   Position eröffnet -> derselbe technische SL/TP-Move ergibt ein um den
-//   Hebel vervielfachtes Euro-Ergebnis.
-// - Margin (eingesetztes Kapital) = Positionsgröße / Hebel = Risiko€ / SL-Abstand%
-//   (unabhängig vom Hebel - der Hebel bestimmt nur, wie viel Nominalwert
-//   diese Margin kontrolliert).
-// - Liquidationspreis (grobe Näherung, ohne Gebühren/Maintenance-Margin):
-//   ca. 1/Hebel prozentuale Gegenbewegung vom Einstieg entfernt.
-// - Liegt der Liquidationspreis NÄHER am Einstieg als der technische SL,
-//   würde die Position real schon vor dem SL liquidiert werden -> Warnung
-//   (liquidatesFirst) und die Simulation behandelt das als Totalverlust
-//   der Margin statt eines normalen SL-Treffers.
-function computePaperTradePlan(direction, entryPrice, sweepExtreme, settings) {
+// Hebel-Berechnung (siehe Erklärung im Chat für die Herleitung).
+//
+// KAPITAL-DECKELUNG (Bugfix - vorher konnte die Margin unbegrenzt wachsen,
+// wenn der SL-Abstand sehr eng war, z.B. der ATOM-Vorfall mit 9.452€ Margin
+// bei nur 100€ Start-Kapital):
+// 1) Gesamt-Kaufkraft = aktuelle Paper-Balance * Hebel
+// 2) Verfügbare Kaufkraft = Gesamt-Kaufkraft - Summe der Margin aller
+//    aktuell bereits offenen Positionen
+// 3) Maximale Margin für den NEUEN Trade = verfügbare Kaufkraft / Anzahl
+//    noch freier Positions-Slots (max. offene Positionen minus bereits offene)
+// 4) Die aus Risiko€/SL-Abstand "eigentlich gewünschte" Margin wird auf
+//    dieses Maximum gedeckelt - das eingestellte Euro-Risiko wird dadurch
+//    ggf. UNTERSCHRITTEN, nie überschritten
+// 5) Notfall-Schutz: die Margin darf zusätzlich NIE die aktuelle Balance
+//    selbst übersteigen, komplett unabhängig von der obigen Rechnung
+function computePaperTradePlan(direction, entryPrice, sweepExtreme, settings, capContext) {
   const bufferPct = 0.0015;
   const leverage = Math.max(1, Number(settings.leverage) || 1);
   let stopLoss, distance;
@@ -626,8 +636,19 @@ function computePaperTradePlan(direction, entryPrice, sweepExtreme, settings) {
     ? entryPrice + distance * settings.riskRewardRatio
     : entryPrice - distance * settings.riskRewardRatio;
 
-  const positionSizeEur = distancePct > 0 ? (settings.riskPerTradeEur * leverage) / distancePct : 0;
-  const marginEur = leverage > 0 ? positionSizeEur / leverage : positionSizeEur;
+  const desiredMarginEur = distancePct > 0 ? settings.riskPerTradeEur / distancePct : 0;
+
+  const totalBuyingPower = capContext.balanceEur * leverage;
+  const availableBuyingPower = Math.max(0, totalBuyingPower - capContext.usedMarginEur);
+  const freeSlots = Math.max(1, capContext.freeSlots);
+  const maxMarginPerTrade = availableBuyingPower / freeSlots;
+
+  let marginEur = Math.min(desiredMarginEur, maxMarginPerTrade);
+  marginEur = Math.min(marginEur, capContext.balanceEur); // Notfall-Schutz (Punkt 4)
+  marginEur = Math.max(0, marginEur);
+
+  const positionSizeEur = marginEur * leverage;
+  const effectiveRiskEur = positionSizeEur * distancePct;
 
   const liquidationDistancePct = 1 / leverage;
   const liquidationPrice = direction === 'long'
@@ -635,7 +656,7 @@ function computePaperTradePlan(direction, entryPrice, sweepExtreme, settings) {
     : entryPrice * (1 + liquidationDistancePct);
   const liquidatesFirst = liquidationDistancePct < distancePct;
 
-  return { stopLoss, takeProfit, positionSizeEur, marginEur, leverage, liquidationPrice, liquidatesFirst };
+  return { stopLoss, takeProfit, positionSizeEur, marginEur, leverage, liquidationPrice, liquidatesFirst, effectiveRiskEur };
 }
 
 // NUR SIMULATION - prüft offene Paper-Trades auf SL/TP und öffnet ggf.
@@ -710,8 +731,12 @@ async function checkPaperSymbol(symbol, settings) {
   );
   if (stillOpenForSymbol[0].c > 0) return;
 
-  const { rows: totalOpenRows } = await pgPool.query("SELECT COUNT(*)::int AS c FROM paper_trades WHERE status = 'open'");
-  if (totalOpenRows[0].c >= settings.maxOpenPositions) return;
+  const { rows: openAggRows } = await pgPool.query(
+    "SELECT COUNT(*)::int AS c, COALESCE(SUM(margin_eur), 0) AS used_margin FROM paper_trades WHERE status = 'open'"
+  );
+  const totalOpenCount = openAggRows[0].c;
+  const usedMarginEur = Number(openAggRows[0].used_margin);
+  if (totalOpenCount >= settings.maxOpenPositions) return;
 
   const setup = detectPaperSetup(candles);
 
@@ -763,13 +788,22 @@ async function checkPaperSymbol(symbol, settings) {
   await logCheck({ sweepBosFound: true, direction: setup.direction, failedCriteria: null, note: 'Sweep+BOS gefunden, alle aktivierten Zusatzkriterien erfüllt - Trade eröffnet.' });
 
   // Kein Gemini-Gegencheck mehr: Trade wird direkt eröffnet, sobald alle
-  // aktivierten technischen Kriterien erfüllt sind.
+  // aktivierten technischen Kriterien erfüllt sind - Positionsgröße wird
+  // dabei auf die verfügbare Kaufkraft gedeckelt (siehe computePaperTradePlan).
   const entryPrice = lastPrice;
-  const plan = computePaperTradePlan(setup.direction, entryPrice, setup.sweepExtreme, settings);
+  const freeSlots = settings.maxOpenPositions - totalOpenCount;
+  const capContext = { balanceEur: settings.balanceEur, usedMarginEur, freeSlots };
+  const plan = computePaperTradePlan(setup.direction, entryPrice, setup.sweepExtreme, settings, capContext);
+
+  if (plan.marginEur < 0.01) {
+    await logCheck({ sweepBosFound: true, direction: setup.direction, failedCriteria: 'Kapital', note: 'Sweep+BOS gefunden, aber keine verfügbare Kaufkraft mehr für eine neue Position.' });
+    return;
+  }
+
   await pgPool.query(
     `INSERT INTO paper_trades (id, symbol, direction, entry_price, stop_loss, take_profit, position_size_eur, risk_eur, leverage, margin_eur, liquidation_price, liquidates_first, criteria_trend, criteria_volume, criteria_mtf, reason, status, opened_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'open', now())`,
-    [crypto.randomUUID(), symbol, setup.direction, entryPrice, plan.stopLoss, plan.takeProfit, plan.positionSizeEur, settings.riskPerTradeEur, plan.leverage, plan.marginEur, plan.liquidationPrice, plan.liquidatesFirst, trend.pass, volume.pass, mtf.pass, setup.reason]
+    [crypto.randomUUID(), symbol, setup.direction, entryPrice, plan.stopLoss, plan.takeProfit, plan.positionSizeEur, plan.effectiveRiskEur, plan.leverage, plan.marginEur, plan.liquidationPrice, plan.liquidatesFirst, trend.pass, volume.pass, mtf.pass, setup.reason]
   );
 }
 

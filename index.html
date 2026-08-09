@@ -6985,6 +6985,9 @@
       : '';
     const badges = atCriteriaBadgesHtml(t.criteriaTrend, t.criteriaVolume, t.criteriaMtf);
     const geminiNote = t.geminiReasoning ? `<div class="trade-gemini-note">🤖 ${escapeHtml(t.geminiReasoning)}</div>` : '';
+    const buggyWarning = t.flaggedBuggy
+      ? `<div class="trade-liq-warning">⚠ Fehlerhafte Berechnung (Bug, seit behoben) — diese Margin entstand durch einen inzwischen gefixten Rechenfehler und ist nicht repräsentativ.</div>`
+      : '';
 
     const gridItems = isOpen
       ? [
@@ -7015,6 +7018,7 @@
         <span class="trade-dir ${dirClass}">${dirLabel} · ${t.leverage}x</span>
       </div>
       ${badges}
+      ${buggyWarning}
       <div class="at-trade-grid">${gridHtml}</div>
       ${liqWarning}
       ${geminiNote}
