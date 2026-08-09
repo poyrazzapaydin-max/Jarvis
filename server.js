@@ -847,7 +847,7 @@ async function runPaperTradingCycle() {
   await pgPool.query('UPDATE paper_settings SET last_check = now() WHERE id = 1');
 }
 
-const PAPER_CHECK_INTERVAL_MS = 7 * 60 * 1000; // alle 7 Minuten (Vorgabe: 5-10 Min)
+const PAPER_CHECK_INTERVAL_MS = 2 * 60 * 1000; // alle 2 Minuten (vorher 7 - responsiver, ohne Server-Last zu sprengen)
 setInterval(runPaperTradingCycle, PAPER_CHECK_INTERVAL_MS);
 
 app.get('/api/paper-trading/state', async (req, res) => {
@@ -888,7 +888,7 @@ app.get('/api/paper-trading/state', async (req, res) => {
       checkedAt: new Date(r.checked_at).getTime()
     }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, insights, checkLog, lastCheck: settings.lastCheck });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, insights, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PAPER_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('Paper-Trading: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -1278,7 +1278,7 @@ async function runNyTradingCycle() {
   await pgPool.query('UPDATE ny_settings SET last_check = now() WHERE id = 1');
 }
 
-const NY_CHECK_INTERVAL_MS = 5 * 60 * 1000; // alle 5 Minuten (Strategie arbeitet auf 5m-Basis)
+const NY_CHECK_INTERVAL_MS = 2 * 60 * 1000; // alle 2 Minuten (vorher 5 - responsiver, ohne Server-Last zu sprengen)
 setInterval(runNyTradingCycle, NY_CHECK_INTERVAL_MS);
 
 app.get('/api/ny-trading/state', async (req, res) => {
@@ -1306,7 +1306,7 @@ app.get('/api/ny-trading/state', async (req, res) => {
       id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime()
     }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: NY_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('NY Range Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });

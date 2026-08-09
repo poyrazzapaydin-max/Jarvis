@@ -3246,6 +3246,40 @@
     line-height: 1.4;
   }
 
+  .pnl-color-up { color: var(--green); }
+  .pnl-color-down { color: var(--red); }
+
+  .trade-pnl-big {
+    font-size: 1.25rem;
+    font-weight: 700;
+    line-height: 1;
+  }
+
+  .at-tp-sl-projection {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    margin: 2px 0;
+  }
+
+  .at-distance-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    margin: 2px 0 4px;
+  }
+
+  .at-countdown-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.78rem;
+    color: var(--cyan);
+    margin-top: 4px;
+  }
+
   .trade-liq-warning {
     font-size: 0.68rem;
     color: #ffb0bc;
@@ -3639,6 +3673,7 @@
         <div class="at-sim-banner">⚠ SIMULATION — kein echtes Geld im Einsatz. Es werden keine echten MEXC-Orders ausgeführt.</div>
         <div class="at-update-row">
           <span class="mono" id="atUpdateInfo">—</span>
+          <span class="at-countdown-row mono" id="atCountdownRow">Nächste Prüfung in: —</span>
           <span class="at-save-toast" id="atSaveToast">Einstellungen gespeichert ✓</span>
         </div>
 
@@ -3728,6 +3763,7 @@
         <div class="at-sim-banner">⚠ SIMULATION — kein echtes Geld im Einsatz. Es werden keine echten MEXC-Orders ausgeführt.</div>
         <div class="at-update-row">
           <span class="mono" id="nyUpdateInfo">—</span>
+          <span class="at-countdown-row mono" id="nyCountdownRow">Nächste Prüfung in: —</span>
           <span class="at-save-toast" id="nySaveToast">Einstellungen gespeichert ✓</span>
         </div>
 
@@ -7016,6 +7052,28 @@
     return value.toLocaleString('de-DE', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
   }
 
+  // Gemeinsam von Auto Trader und NY Range Bot genutzt: reine Anzeige-
+  // Berechnungen aus bereits vorhandenen Trade-Daten (verändert keine
+  // Trade-Werte, nur Darstellung).
+  function computeTradeExtras(t, currentPrice) {
+    const tpProfitEur = t.direction === 'long'
+      ? (t.takeProfit - t.entryPrice) / t.entryPrice * t.positionSizeEur
+      : (t.entryPrice - t.takeProfit) / t.entryPrice * t.positionSizeEur;
+    const slLossEur = t.direction === 'long'
+      ? (t.stopLoss - t.entryPrice) / t.entryPrice * t.positionSizeEur
+      : (t.entryPrice - t.stopLoss) / t.entryPrice * t.positionSizeEur;
+    let pctToSl = null, pctToTp = null;
+    if (currentPrice != null) {
+      pctToSl = Math.abs(currentPrice - t.stopLoss) / currentPrice * 100;
+      pctToTp = Math.abs(t.takeProfit - currentPrice) / currentPrice * 100;
+    }
+    return { tpProfitEur, slLossEur, pctToSl, pctToTp };
+  }
+
+  function pnlColorClass(value) {
+    return value >= 0 ? 'pnl-color-up' : 'pnl-color-down';
+  }
+
   function atSkippedRowHtml(s) {
     const dirClass = s.direction === 'long' ? 'long' : 'short';
     const dirLabel = s.direction === 'long' ? 'LONG' : 'SHORT';
@@ -7055,8 +7113,8 @@
     const dirClass = t.direction === 'long' ? 'long' : 'short';
     const dirLabel = t.direction === 'long' ? 'LONG' : 'SHORT';
     const pnl = isOpen ? t.unrealizedPnlEur : t.pnlEur;
-    const pnlClass = (pnl == null) ? '' : (pnl >= 0 ? 'up' : 'down');
     const pnlText = (pnl == null) ? '--' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}€`;
+    const pnlColorCls = pnl == null ? '' : pnlColorClass(pnl);
     const time = new Date(isOpen ? t.openedAt : t.closedAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
     const liqWarning = t.liquidatesFirst
       ? `<div class="trade-liq-warning">⚠ Hebel ${t.leverage}x: Liquidation (${formatAutoPrice(t.liquidationPrice)}) liegt näher am Einstieg als der technische SL — würde real vor dem SL liquidiert.</div>`
@@ -7065,6 +7123,14 @@
     const geminiNote = t.geminiReasoning ? `<div class="trade-gemini-note">🤖 ${escapeHtml(t.geminiReasoning)}</div>` : '';
     const buggyWarning = t.flaggedBuggy
       ? `<div class="trade-liq-warning">⚠ Fehlerhafte Berechnung (Bug, seit behoben) — diese Margin entstand durch einen inzwischen gefixten Rechenfehler und ist nicht repräsentativ.</div>`
+      : '';
+
+    const extras = computeTradeExtras(t, isOpen ? t.currentPrice : null);
+    const tpSlProjection = isOpen
+      ? `<div class="at-tp-sl-projection"><span class="pnl-color-up">Bei TP: +${extras.tpProfitEur.toFixed(2)}€</span><span class="pnl-color-down">Bei SL: ${extras.slLossEur.toFixed(2)}€</span></div>`
+      : '';
+    const distanceRow = (isOpen && extras.pctToSl != null)
+      ? `<div class="at-distance-row"><span>SL in ${extras.pctToSl.toFixed(2)}%</span><span>TP in ${extras.pctToTp.toFixed(2)}%</span></div>`
       : '';
 
     const gridItems = isOpen
@@ -7098,11 +7164,13 @@
       ${badges}
       ${buggyWarning}
       <div class="at-trade-grid">${gridHtml}</div>
+      ${tpSlProjection}
+      ${distanceRow}
       ${liqWarning}
       ${geminiNote}
       <div class="trade-row-bottom">
         <span class="trade-time mono">${time}</span>
-        <span class="trade-pnl mono ${pnlClass}">${pnlText}</span>
+        <span class="trade-pnl-big mono ${pnlColorCls}">${pnlText}</span>
       </div>
       <details class="at-trade-details">
         <summary>Details (Erkennungsgrund)</summary>
@@ -7216,7 +7284,7 @@
         if (openTrades.length) {
           const totalPnl = openTrades.reduce((sum, t) => sum + (t.unrealizedPnlEur || 0), 0);
           totalPnlValue.textContent = `${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}€`;
-          totalPnlValue.className = 'mono ' + (totalPnl >= 0 ? 'up' : 'down');
+          totalPnlValue.className = 'mono trade-pnl-big ' + pnlColorClass(totalPnl);
           totalPnlRow.style.display = 'block';
         } else {
           totalPnlRow.style.display = 'none';
@@ -7224,6 +7292,7 @@
       }
 
       atLastLoadTime = Date.now();
+      atNextCheckAt = data.lastCheck && data.checkIntervalMs ? data.lastCheck + data.checkIntervalMs : null;
       updateAtUpdateInfo();
 
       const closedEl = document.getElementById('atClosedList');
@@ -7325,11 +7394,22 @@
   });
 
   let atLastLoadTime = null;
+  let atNextCheckAt = null;
   function updateAtUpdateInfo() {
     const el = document.getElementById('atUpdateInfo');
-    if (!el || !atLastLoadTime) return;
-    const secs = Math.round((Date.now() - atLastLoadTime) / 1000);
-    el.textContent = secs < 2 ? 'Gerade aktualisiert' : `Aktualisiert vor ${secs}s`;
+    if (el && atLastLoadTime) {
+      const secs = Math.round((Date.now() - atLastLoadTime) / 1000);
+      el.textContent = secs < 2 ? 'Gerade aktualisiert' : `Aktualisiert vor ${secs}s`;
+    }
+    const cdEl = document.getElementById('atCountdownRow');
+    if (cdEl) {
+      if (atNextCheckAt) {
+        const remainingSecs = Math.round((atNextCheckAt - Date.now()) / 1000);
+        cdEl.textContent = remainingSecs > 0 ? `Nächste Prüfung in: ${remainingSecs}s` : 'Nächste Prüfung: läuft gerade…';
+      } else {
+        cdEl.textContent = 'Nächste Prüfung in: —';
+      }
+    }
   }
   setInterval(updateAtUpdateInfo, 1000);
 
@@ -7388,10 +7468,18 @@
     const dirClass = t.direction === 'long' ? 'long' : 'short';
     const dirLabel = t.direction === 'long' ? 'LONG' : 'SHORT';
     const pnl = isOpen ? t.unrealizedPnlEur : t.pnlEur;
-    const pnlClass = (pnl == null) ? '' : (pnl >= 0 ? 'up' : 'down');
     const pnlText = (pnl == null) ? '--' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}€`;
+    const pnlColorCls = pnl == null ? '' : pnlColorClass(pnl);
     const time = new Date(isOpen ? t.openedAt : t.closedAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
     const slTypeLabel = t.slType === 'extreme' ? 'am Extrempunkt' : t.slType === 'pivot' ? 'an lokalem Pivot' : 'Fallback 1%';
+
+    const extras = computeTradeExtras(t, isOpen ? t.currentPrice : null);
+    const tpSlProjection = isOpen
+      ? `<div class="at-tp-sl-projection"><span class="pnl-color-up">Bei TP: +${extras.tpProfitEur.toFixed(2)}€</span><span class="pnl-color-down">Bei SL: ${extras.slLossEur.toFixed(2)}€</span></div>`
+      : '';
+    const distanceRow = (isOpen && extras.pctToSl != null)
+      ? `<div class="at-distance-row"><span>SL in ${extras.pctToSl.toFixed(2)}%</span><span>TP in ${extras.pctToTp.toFixed(2)}%</span></div>`
+      : '';
 
     const gridItems = [
       ['Range Hoch/Tief', `${formatAutoPrice(t.rangeLow)} – ${formatAutoPrice(t.rangeHigh)}`],
@@ -7415,9 +7503,11 @@
         <span class="trade-dir ${dirClass}">${dirLabel} · ${t.leverage}x</span>
       </div>
       <div class="at-trade-grid">${gridHtml}</div>
+      ${tpSlProjection}
+      ${distanceRow}
       <div class="trade-row-bottom">
         <span class="trade-time mono">${time}</span>
-        <span class="trade-pnl mono ${pnlClass}">${pnlText}</span>
+        <span class="trade-pnl-big mono ${pnlColorCls}">${pnlText}</span>
       </div>
       <details class="at-trade-details">
         <summary>Details (Erkennungsgrund)</summary>
@@ -7526,7 +7616,7 @@
         if (openTrades.length) {
           const totalPnl = openTrades.reduce((sum, t) => sum + (t.unrealizedPnlEur || 0), 0);
           totalPnlValue.textContent = `${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}€`;
-          totalPnlValue.className = 'mono ' + (totalPnl >= 0 ? 'up' : 'down');
+          totalPnlValue.className = 'mono trade-pnl-big ' + pnlColorClass(totalPnl);
           totalPnlRow.style.display = 'block';
         } else {
           totalPnlRow.style.display = 'none';
@@ -7554,6 +7644,7 @@
       }
 
       nyLastLoadTime = Date.now();
+      nyNextCheckAt = data.lastCheck && data.checkIntervalMs ? data.lastCheck + data.checkIntervalMs : null;
       updateNyUpdateInfo();
     } catch (err) {
       console.error('NY Range Bot: Laden fehlgeschlagen', err);
@@ -7606,11 +7697,22 @@
   });
 
   let nyLastLoadTime = null;
+  let nyNextCheckAt = null;
   function updateNyUpdateInfo() {
     const el = document.getElementById('nyUpdateInfo');
-    if (!el || !nyLastLoadTime) return;
-    const secs = Math.round((Date.now() - nyLastLoadTime) / 1000);
-    el.textContent = secs < 2 ? 'Gerade aktualisiert' : `Aktualisiert vor ${secs}s`;
+    if (el && nyLastLoadTime) {
+      const secs = Math.round((Date.now() - nyLastLoadTime) / 1000);
+      el.textContent = secs < 2 ? 'Gerade aktualisiert' : `Aktualisiert vor ${secs}s`;
+    }
+    const cdEl = document.getElementById('nyCountdownRow');
+    if (cdEl) {
+      if (nyNextCheckAt) {
+        const remainingSecs = Math.round((nyNextCheckAt - Date.now()) / 1000);
+        cdEl.textContent = remainingSecs > 0 ? `Nächste Prüfung in: ${remainingSecs}s` : 'Nächste Prüfung: läuft gerade…';
+      } else {
+        cdEl.textContent = 'Nächste Prüfung in: —';
+      }
+    }
   }
   setInterval(updateNyUpdateInfo, 1000);
 
