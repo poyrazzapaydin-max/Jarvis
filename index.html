@@ -3310,6 +3310,9 @@
         <div class="nav-item" data-view="autotrader">
           <span class="icon">🤖</span> Auto Trader
         </div>
+        <div class="nav-item" data-view="nybot">
+          <span class="icon">🗽</span> NY Range Bot
+        </div>
         <div class="nav-item" data-view="analyse">
           <span class="icon">🧠</span> Analyse
         </div>
@@ -3712,6 +3715,76 @@
         </div>
       </div>
 
+      <!-- NY Range Bot view (zweiter, unabhängiger Paper-Trading-Bot) -->
+      <div class="view-flex-col" id="view-nybot" style="display:none;">
+        <div class="portfolio-header">
+          <div>
+            <div class="view-panel-title">NY RANGE BOT</div>
+            <div class="portfolio-claim">NY Midnight Range Reversal — Simulation</div>
+          </div>
+          <button class="mini-toggle-btn off" id="nyEnableToggle">🔴 SIMULATION AUS</button>
+        </div>
+
+        <div class="at-sim-banner">⚠ SIMULATION — kein echtes Geld im Einsatz. Es werden keine echten MEXC-Orders ausgeführt.</div>
+        <div class="at-update-row">
+          <span class="mono" id="nyUpdateInfo">—</span>
+          <span class="at-save-toast" id="nySaveToast">Einstellungen gespeichert ✓</span>
+        </div>
+
+        <div class="news-body">
+
+          <div class="panel-card">
+            <div class="panel-title">REGELWERK</div>
+            <div class="at-settings-grid">
+              <label>Start-Kapital (€)<input type="number" step="1" min="1" class="select-input" id="nyStartCapital"></label>
+              <label>Anzahl fester Slots<input type="number" step="1" min="1" max="20" class="select-input" id="nySlots"></label>
+              <label>Hebel (1x - 10x)<input type="number" step="1" min="1" max="10" class="select-input" id="nyLeverage"></label>
+            </div>
+            <div class="panel-title" style="margin-top:14px;">BEOBACHTETE COINS</div>
+            <div class="at-coin-select" id="nyCoinSelect"></div>
+            <div class="quick-action-row" style="margin-top:14px;">
+              <button class="big-analyze-btn" id="nySaveSettingsBtn" style="padding:11px 24px; font-size:0.8rem;">Einstellungen speichern</button>
+              <button class="quick-action-btn danger" id="nyResetBtn">⟲ Simulation zurücksetzen</button>
+            </div>
+            <div class="trades-range-info mono" id="nyLastCheckInfo"></div>
+          </div>
+
+          <div class="portfolio-stats-row">
+            <div class="stat-box"><div class="stat-label">PAPER-BALANCE</div><div class="stat-value mono" id="nyBalance">--</div></div>
+            <div class="stat-box"><div class="stat-label">GESAMTERGEBNIS</div><div class="stat-value mono" id="nyTotalResult">--</div></div>
+            <div class="stat-box"><div class="stat-label">TRADES GESAMT</div><div class="stat-value mono" id="nyTradeCount">--</div></div>
+            <div class="stat-box"><div class="stat-label">GEWINNRATE</div><div class="stat-value mono" id="nyWinRate">--</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">PAPER-BALANCE-VERLAUF</div>
+            <div class="portfolio-chart-wrap" style="height:180px;">
+              <canvas id="nyBalanceChart" width="900" height="180"></canvas>
+              <div class="chart-placeholder-msg" id="nyChartPlaceholder">Noch keine Verlaufsdaten.</div>
+            </div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">OFFENE PAPER-POSITIONEN</div>
+            <div class="at-total-pnl-row" id="nyOpenTotalPnl" style="display:none;">
+              Unrealisierter Gesamt-PnL: <span class="mono" id="nyOpenTotalPnlValue">--</span>
+            </div>
+            <div class="trade-list" id="nyOpenList"><div class="notes-empty">Keine offenen Positionen.</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">GESCHLOSSENE PAPER-TRADES</div>
+            <div class="trade-list" id="nyClosedList"><div class="notes-empty">Noch keine geschlossenen Trades.</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">ÜBERSPRUNGENE SETUPS <span class="card-title-hint">— erkannt, aber kein freier Slot</span></div>
+            <div class="trade-list" id="nySkippedList"><div class="notes-empty">Noch keine übersprungenen Setups.</div></div>
+          </div>
+
+        </div>
+      </div>
+
       <!-- Analyse view (Market Intelligence, full page) -->
       <div class="view-flex-col analyse-view" id="view-analyse" style="display:none;">
         <div class="analyse-hero">
@@ -4102,6 +4175,7 @@
     trading: 'Trading',
     portfolio: 'Portfolio',
     autotrader: 'Auto Trader',
+    nybot: 'NY Range Bot',
     analyse: 'Analyse',
     news: 'News',
     aicore: 'AI Core',
@@ -4116,6 +4190,7 @@
     trading: document.getElementById('view-trading'),
     portfolio: document.getElementById('view-portfolio'),
     autotrader: document.getElementById('view-autotrader'),
+    nybot: document.getElementById('view-nybot'),
     analyse: document.getElementById('view-analyse'),
     news: document.getElementById('view-news'),
     aicore: document.getElementById('view-aicore'),
@@ -4146,6 +4221,9 @@
     }
     if (key === 'autotrader' && typeof loadAutoTraderState === 'function') {
       loadAutoTraderState();
+    }
+    if (key === 'nybot' && typeof loadNyBotState === 'function') {
+      loadNyBotState();
     }
   }
 
@@ -7258,6 +7336,287 @@
   setInterval(() => {
     if (viewPanels.autotrader && viewPanels.autotrader.style.display !== 'none') {
       loadAutoTraderState();
+    }
+  }, 30000);
+
+  // ============ NY RANGE BOT (zweiter, unabhängiger Paper-Trading-Bot) ============
+  // Ruft ausschließlich den eigenen Backend-Endpoint auf, der wiederum nur
+  // öffentliche Binance-Kursdaten liest. Kein Aufruf hier kann eine echte
+  // MEXC-Order auslösen.
+  let nySelectedSymbols = [];
+
+  function nyCoinChipsHtml() {
+    return AUTO_TRADER_SYMBOLS.map(sym => {
+      const active = nySelectedSymbols.includes(sym);
+      return `<span class="at-coin-chip${active ? ' active' : ''}" data-sym="${sym}">${sym.replace('USDT', '/USDT')}</span>`;
+    }).join('');
+  }
+
+  function nyRenderCoinChips() {
+    const el = document.getElementById('nyCoinSelect');
+    if (!el) return;
+    el.innerHTML = nyCoinChipsHtml();
+    el.querySelectorAll('.at-coin-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const sym = chip.dataset.sym;
+        if (nySelectedSymbols.includes(sym)) {
+          nySelectedSymbols = nySelectedSymbols.filter(s => s !== sym);
+        } else {
+          nySelectedSymbols.push(sym);
+        }
+        nyRenderCoinChips();
+      });
+    });
+  }
+
+  function nySkippedRowHtml(s) {
+    const dirClass = s.direction === 'long' ? 'long' : 'short';
+    const dirLabel = s.direction === 'long' ? 'LONG' : 'SHORT';
+    const time = new Date(s.createdAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    return `<div class="trade-row">
+      <div class="trade-row-top">
+        <span class="trade-sym">${escapeHtml(s.symbol.replace('USDT', '/USDT'))}</span>
+        <span class="trade-dir ${dirClass}">${dirLabel}</span>
+      </div>
+      <div class="trade-row-bottom">
+        <span class="trade-time mono">${time} · ${escapeHtml(s.reason || '')}</span>
+      </div>
+    </div>`;
+  }
+
+  function nyTradeRowHtml(t, isOpen) {
+    const dirClass = t.direction === 'long' ? 'long' : 'short';
+    const dirLabel = t.direction === 'long' ? 'LONG' : 'SHORT';
+    const pnl = isOpen ? t.unrealizedPnlEur : t.pnlEur;
+    const pnlClass = (pnl == null) ? '' : (pnl >= 0 ? 'up' : 'down');
+    const pnlText = (pnl == null) ? '--' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}€`;
+    const time = new Date(isOpen ? t.openedAt : t.closedAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    const slTypeLabel = t.slType === 'extreme' ? 'am Extrempunkt' : t.slType === 'pivot' ? 'an lokalem Pivot' : 'Fallback 1%';
+
+    const gridItems = [
+      ['Range Hoch/Tief', `${formatAutoPrice(t.rangeLow)} – ${formatAutoPrice(t.rangeHigh)}`],
+      ['Ausbruch-Extrempunkt', formatAutoPrice(t.breakoutExtreme)],
+      isOpen ? ['Einstieg → Aktuell', `${formatAutoPrice(t.entryPrice)} → ${t.currentPrice != null ? formatAutoPrice(t.currentPrice) : '--'}`] : ['Einstieg → Exit', `${formatAutoPrice(t.entryPrice)} → ${formatAutoPrice(t.exitPrice)}`],
+      ['Stop-Loss', `${formatAutoPrice(t.stopLoss)} (${slTypeLabel})`],
+      ['Take-Profit', `${formatAutoPrice(t.takeProfit)} (${t.rrFactor}x)`],
+      ['Margin', `${t.marginEur.toFixed(2)}€`],
+      ['Positionsgröße', `${t.positionSizeEur.toFixed(2)}€`]
+    ];
+    if (!isOpen) gridItems.push(['Grund', t.closeReason]);
+    const gridHtml = gridItems.map(([label, value]) => `
+      <div class="at-trade-grid-item">
+        <span class="at-trade-grid-label">${escapeHtml(label)}</span>
+        <span class="at-trade-grid-value">${escapeHtml(String(value))}</span>
+      </div>`).join('');
+
+    return `<div class="trade-row">
+      <div class="trade-row-top">
+        <span class="trade-sym">${escapeHtml(t.symbol.replace('USDT', '/USDT'))}</span>
+        <span class="trade-dir ${dirClass}">${dirLabel} · ${t.leverage}x</span>
+      </div>
+      <div class="at-trade-grid">${gridHtml}</div>
+      <div class="trade-row-bottom">
+        <span class="trade-time mono">${time}</span>
+        <span class="trade-pnl mono ${pnlClass}">${pnlText}</span>
+      </div>
+      <details class="at-trade-details">
+        <summary>Details (Erkennungsgrund)</summary>
+        <div class="at-trade-details-text">${escapeHtml(t.reason || '')}</div>
+      </details>
+    </div>`;
+  }
+
+  function nyDrawBalanceChart(history) {
+    const canvas = document.getElementById('nyBalanceChart');
+    const placeholder = document.getElementById('nyChartPlaceholder');
+    if (!canvas) return;
+    if (!history || history.length < 2) {
+      placeholder.classList.add('show');
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+    placeholder.classList.remove('show');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, rect.width, rect.height);
+
+    const values = history.map(p => p.balance);
+    const min = Math.min(...values), max = Math.max(...values);
+    const range = (max - min) || 1;
+    const padTop = 10, padBottom = 10;
+    const usableH = rect.height - padTop - padBottom;
+    const stepX = history.length > 1 ? rect.width / (history.length - 1) : rect.width;
+    const coords = history.map((p, i) => ({ x: i * stepX, y: padTop + usableH - ((p.balance - min) / range) * usableH }));
+
+    const isUp = values[values.length - 1] >= values[0];
+    const lineColor = isUp ? '#34e29a' : '#ff5c72';
+
+    ctx.beginPath();
+    ctx.moveTo(coords[0].x, rect.height);
+    coords.forEach(c => ctx.lineTo(c.x, c.y));
+    ctx.lineTo(coords[coords.length - 1].x, rect.height);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, 0, 0, rect.height);
+    grad.addColorStop(0, isUp ? 'rgba(52,226,154,0.18)' : 'rgba(255,92,114,0.18)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    ctx.beginPath();
+    coords.forEach((c, i) => i === 0 ? ctx.moveTo(c.x, c.y) : ctx.lineTo(c.x, c.y));
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+  }
+
+  async function loadNyBotState() {
+    try {
+      const res = await fetch('/api/ny-trading/state');
+      const data = await res.json();
+
+      if (!res.ok || !data.settings) {
+        const openEl = document.getElementById('nyOpenList');
+        if (openEl) openEl.innerHTML = `<div class="notes-empty">${escapeHtml(data.error || 'NY Range Bot nicht verfügbar.')}</div>`;
+        return;
+      }
+
+      nySelectedSymbols = data.settings.watchedSymbols.slice();
+      nyRenderCoinChips();
+
+      document.getElementById('nyStartCapital').value = data.settings.startCapitalEur;
+      document.getElementById('nySlots').value = data.settings.numSlots;
+      document.getElementById('nyLeverage').value = data.settings.leverage;
+
+      const toggleBtn = document.getElementById('nyEnableToggle');
+      toggleBtn.classList.toggle('on', data.settings.enabled);
+      toggleBtn.classList.toggle('off', !data.settings.enabled);
+      toggleBtn.textContent = data.settings.enabled ? '🟢 SIMULATION AN' : '🔴 SIMULATION AUS';
+
+      const balance = data.balanceEur;
+      const start = data.settings.startCapitalEur;
+      const resultEur = balance - start;
+      const resultPct = start ? (resultEur / start) * 100 : 0;
+      document.getElementById('nyBalance').textContent = `${balance.toFixed(2)}€`;
+      const resultEl = document.getElementById('nyTotalResult');
+      resultEl.textContent = `${resultEur >= 0 ? '+' : ''}${resultEur.toFixed(2)}€ (${resultPct >= 0 ? '+' : ''}${resultPct.toFixed(1)}%)`;
+      resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
+
+      const closed = data.closedTrades || [];
+      document.getElementById('nyTradeCount').textContent = String(closed.length);
+      const wins = closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('nyWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+
+      nyDrawBalanceChart(data.balanceHistory);
+
+      const openEl = document.getElementById('nyOpenList');
+      const openTrades = data.openTrades || [];
+      openEl.innerHTML = openTrades.length
+        ? openTrades.map(t => nyTradeRowHtml(t, true)).join('')
+        : '<div class="notes-empty">Keine offenen Positionen.</div>';
+
+      const totalPnlRow = document.getElementById('nyOpenTotalPnl');
+      const totalPnlValue = document.getElementById('nyOpenTotalPnlValue');
+      if (totalPnlRow && totalPnlValue) {
+        if (openTrades.length) {
+          const totalPnl = openTrades.reduce((sum, t) => sum + (t.unrealizedPnlEur || 0), 0);
+          totalPnlValue.textContent = `${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}€`;
+          totalPnlValue.className = 'mono ' + (totalPnl >= 0 ? 'up' : 'down');
+          totalPnlRow.style.display = 'block';
+        } else {
+          totalPnlRow.style.display = 'none';
+        }
+      }
+
+      const closedEl = document.getElementById('nyClosedList');
+      closedEl.innerHTML = closed.length
+        ? closed.map(t => nyTradeRowHtml(t, false)).join('')
+        : '<div class="notes-empty">Noch keine geschlossenen Trades.</div>';
+
+      const skippedEl = document.getElementById('nySkippedList');
+      if (skippedEl) {
+        const skipped = data.skippedSetups || [];
+        skippedEl.innerHTML = skipped.length
+          ? skipped.map(nySkippedRowHtml).join('')
+          : '<div class="notes-empty">Noch keine übersprungenen Setups.</div>';
+      }
+
+      const lastCheckEl = document.getElementById('nyLastCheckInfo');
+      if (lastCheckEl) {
+        lastCheckEl.textContent = data.lastCheck
+          ? `Letzte Prüfung: ${new Date(data.lastCheck).toLocaleString('de-DE')}`
+          : 'Noch keine Prüfung durchgeführt.';
+      }
+
+      nyLastLoadTime = Date.now();
+      updateNyUpdateInfo();
+    } catch (err) {
+      console.error('NY Range Bot: Laden fehlgeschlagen', err);
+    }
+  }
+
+  async function nySaveSettings(enabledOverride) {
+    const toggleBtn = document.getElementById('nyEnableToggle');
+    const enabled = enabledOverride !== undefined ? enabledOverride : toggleBtn.classList.contains('on');
+    const body = {
+      enabled,
+      startCapitalEur: parseFloat(document.getElementById('nyStartCapital').value),
+      numSlots: parseInt(document.getElementById('nySlots').value, 10),
+      leverage: parseInt(document.getElementById('nyLeverage').value, 10),
+      watchedSymbols: nySelectedSymbols
+    };
+    await fetch('/api/ny-trading/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    addFeedEntry('NY-Range-Bot-Einstellungen gespeichert');
+    loadNyBotState();
+  }
+
+  function showNySaveToast() {
+    const toast = document.getElementById('nySaveToast');
+    if (!toast) return;
+    toast.classList.add('show');
+    clearTimeout(showNySaveToast._t);
+    showNySaveToast._t = setTimeout(() => toast.classList.remove('show'), 2500);
+  }
+
+  document.getElementById('nyEnableToggle').addEventListener('click', () => {
+    const btn = document.getElementById('nyEnableToggle');
+    const nowEnabled = !btn.classList.contains('on');
+    nySaveSettings(nowEnabled);
+  });
+
+  document.getElementById('nySaveSettingsBtn').addEventListener('click', () => {
+    nySaveSettings();
+    showNySaveToast();
+  });
+
+  document.getElementById('nyResetBtn').addEventListener('click', async () => {
+    if (!confirm('NY-Range-Bot-Simulation wirklich zurücksetzen? Balance-Verlauf und alle offenen/geschlossenen Paper-Trades werden gelöscht.')) return;
+    await fetch('/api/ny-trading/reset', { method: 'POST' });
+    addFeedEntry('NY-Range-Bot-Simulation zurückgesetzt');
+    loadNyBotState();
+  });
+
+  let nyLastLoadTime = null;
+  function updateNyUpdateInfo() {
+    const el = document.getElementById('nyUpdateInfo');
+    if (!el || !nyLastLoadTime) return;
+    const secs = Math.round((Date.now() - nyLastLoadTime) / 1000);
+    el.textContent = secs < 2 ? 'Gerade aktualisiert' : `Aktualisiert vor ${secs}s`;
+  }
+  setInterval(updateNyUpdateInfo, 1000);
+
+  setInterval(() => {
+    if (viewPanels.nybot && viewPanels.nybot.style.display !== 'none') {
+      loadNyBotState();
     }
   }, 30000);
 

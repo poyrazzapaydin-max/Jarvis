@@ -945,6 +945,416 @@ app.post('/api/paper-trading/reset', async (req, res) => {
   }
 });
 
+// ============================================================
+// NY RANGE BOT - zweiter, komplett unabhängiger Paper-Trading-Bot
+// (eigene Strategie, eigener Kapitalschutz, eigene DB-Tabellen "ny_*").
+//
+// SICHERHEIT: Wie beim ersten Bot - liest ausschließlich öffentliche
+// Binance-Kursdaten, verändert nur lokal simulierte Werte. Kein
+// Codepfad hier kann eine echte Order auslösen. NUR SIMULATION.
+//
+// STRATEGIE "NY Midnight Range Reversal":
+// 1) Die 00:00-04:00-Uhr-New-York-Kerze (Zeitzone/Sommerzeit über
+//    Intl-Zeitzonendatenbank berücksichtigt) markiert Hoch/Tief der
+//    Tages-Range. Gültig bis zur nächsten 00:00-04:00-NY-Range.
+// 2) Bricht der Kurs auf 5-Minuten-Basis aus der Range aus (Wick reicht)
+//    und schließt eine 5m-Kerze wieder INNERHALB der Range, wird SOFORT
+//    ein Trade GEGEN die Ausbruchsrichtung eröffnet.
+// 3) SL am Extrempunkt des Ausbruchs, außer der Extrempunkt liegt >1,5%
+//    von der Range-Grenze entfernt - dann wird ein lokales Pivot
+//    zwischen Range-Grenze und Extrempunkt gesucht (Fallback: 1% vom
+//    Einstieg). TP-Faktor gestaffelt nach SL-Enge (2x/3x/4x).
+// ============================================================
+const NY_DEFAULT_SETTINGS = {
+  enabled: false,
+  startCapitalEur: 100,
+  numSlots: 5,
+  leverage: 5
+};
+
+async function initNyTradingSchema() {
+  if (!pgPool) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS ny_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      start_capital_eur NUMERIC NOT NULL DEFAULT 100,
+      num_slots INTEGER NOT NULL DEFAULT 5,
+      leverage INTEGER NOT NULL DEFAULT 5,
+      balance_eur NUMERIC NOT NULL DEFAULT 100,
+      watched_symbols TEXT[] NOT NULL DEFAULT ARRAY['BTCUSDT','ETHUSDT','SOLUSDT'],
+      last_check TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS ny_trades (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      entry_price NUMERIC NOT NULL,
+      stop_loss NUMERIC NOT NULL,
+      take_profit NUMERIC NOT NULL,
+      sl_type TEXT NOT NULL,
+      rr_factor NUMERIC NOT NULL,
+      margin_eur NUMERIC NOT NULL,
+      position_size_eur NUMERIC NOT NULL,
+      leverage INTEGER NOT NULL,
+      range_high NUMERIC NOT NULL,
+      range_low NUMERIC NOT NULL,
+      breakout_extreme NUMERIC NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      opened_at TIMESTAMPTZ NOT NULL,
+      exit_price NUMERIC,
+      close_reason TEXT,
+      pnl_eur NUMERIC,
+      closed_at TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS ny_balance_history (
+      id SERIAL PRIMARY KEY,
+      time TIMESTAMPTZ NOT NULL DEFAULT now(),
+      balance NUMERIC NOT NULL
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS ny_skipped_setups (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  const { rows } = await pgPool.query('SELECT id FROM ny_settings WHERE id = 1');
+  if (!rows.length) {
+    await pgPool.query(
+      `INSERT INTO ny_settings (id, enabled, start_capital_eur, num_slots, leverage, balance_eur, watched_symbols)
+       VALUES (1, false, $1, $2, $3, $1, $4)`,
+      [NY_DEFAULT_SETTINGS.startCapitalEur, NY_DEFAULT_SETTINGS.numSlots, NY_DEFAULT_SETTINGS.leverage,
+       ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT']]
+    );
+    await pgPool.query('INSERT INTO ny_balance_history (balance) VALUES ($1)', [NY_DEFAULT_SETTINGS.startCapitalEur]);
+  }
+}
+
+function nyRowToSettings(row) {
+  return {
+    enabled: row.enabled,
+    startCapitalEur: Number(row.start_capital_eur),
+    numSlots: Number(row.num_slots),
+    leverage: Number(row.leverage),
+    balanceEur: Number(row.balance_eur),
+    watchedSymbols: row.watched_symbols,
+    lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
+  };
+}
+
+async function getNySettings() {
+  const { rows } = await pgPool.query('SELECT * FROM ny_settings WHERE id = 1');
+  return nyRowToSettings(rows[0]);
+}
+
+function nyRowToTrade(row) {
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    direction: row.direction,
+    entryPrice: Number(row.entry_price),
+    stopLoss: Number(row.stop_loss),
+    takeProfit: Number(row.take_profit),
+    slType: row.sl_type,
+    rrFactor: Number(row.rr_factor),
+    marginEur: Number(row.margin_eur),
+    positionSizeEur: Number(row.position_size_eur),
+    leverage: Number(row.leverage),
+    rangeHigh: Number(row.range_high),
+    rangeLow: Number(row.range_low),
+    breakoutExtreme: Number(row.breakout_extreme),
+    reason: row.reason,
+    openedAt: new Date(row.opened_at).getTime(),
+    exitPrice: row.exit_price != null ? Number(row.exit_price) : null,
+    closeReason: row.close_reason,
+    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null,
+    closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null
+  };
+}
+
+const nyLastPrices = {};
+
+// New-York-Ortszeit für einen UTC-Zeitstempel (berücksichtigt automatisch
+// Sommerzeit über die Intl-Zeitzonendatenbank von Node).
+function getNyParts(utcMs) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+  });
+  const map = {};
+  dtf.formatToParts(new Date(utcMs)).forEach(p => { map[p.type] = p.value; });
+  return { date: `${map.year}-${map.month}-${map.day}`, hour: Number(map.hour) === 24 ? 0 : Number(map.hour) };
+}
+
+// Aggregiert alle 5m-Kerzen, deren NY-Ortszeit zwischen 00:00 und 04:00 liegt,
+// pro NY-Kalendertag zu einem Hoch/Tief. Gibt die jüngste bereits vollständig
+// abgeschlossene Range zurück (gültig bis zur nächsten).
+function computeNyRange(candles, intervalMs) {
+  const windows = {};
+  for (const c of candles) {
+    const { date, hour } = getNyParts(c.time);
+    if (hour >= 0 && hour < 4) {
+      if (!windows[date]) windows[date] = { high: -Infinity, low: Infinity, windowEnd: 0 };
+      windows[date].high = Math.max(windows[date].high, c.high);
+      windows[date].low = Math.min(windows[date].low, c.low);
+      windows[date].windowEnd = Math.max(windows[date].windowEnd, c.time + intervalMs);
+    }
+  }
+  const now = Date.now();
+  const validDates = Object.keys(windows).filter(d => windows[d].windowEnd <= now).sort();
+  if (!validDates.length) return null;
+  const latest = validDates[validDates.length - 1];
+  return { high: windows[latest].high, low: windows[latest].low, date: latest };
+}
+
+// Erkennt den Ausbruch-und-Rückkehr-Moment: die aktuellste (letzte) Kerze
+// schließt wieder innerhalb der Range, die Kerze(n) direkt davor lagen
+// (per Schlusskurs) durchgehend außerhalb - das begrenzt das Signal auf
+// genau den Übergangsmoment (kein wiederholtes Auslösen in Folgezyklen).
+function detectNyRangeSetup(candles, range) {
+  const n = candles.length;
+  if (n < 3) return null;
+  const last = candles[n - 1];
+  const insideNow = last.close >= range.low && last.close <= range.high;
+  if (!insideNow) return null;
+
+  const prev = candles[n - 2];
+  const prevAbove = prev.close > range.high;
+  const prevBelow = prev.close < range.low;
+  if (!prevAbove && !prevBelow) return null;
+
+  let extreme = prevAbove ? Math.max(prev.high, last.high) : Math.min(prev.low, last.low);
+  for (let i = n - 3; i >= 0 && i >= n - 40; i--) {
+    const c = candles[i];
+    const stillOutside = prevAbove ? c.close > range.high : c.close < range.low;
+    if (!stillOutside) break;
+    extreme = prevAbove ? Math.max(extreme, c.high) : Math.min(extreme, c.low);
+  }
+
+  return { direction: prevAbove ? 'short' : 'long', extreme, entryPrice: last.close };
+}
+
+// Sucht ein lokales Pivot-Level zwischen der Range-Grenze und dem
+// Extrempunkt (3-Kerzen-Pivot-Fenster) - genutzt, wenn der Extrempunkt zu
+// weit von der Range entfernt liegt (>1,5%, siehe computeNySlTp).
+function findNyPivotBetween(candles, direction, boundary, extreme) {
+  const { highs, lows } = findLocalExtrema(candles, 3);
+  if (direction === 'short') {
+    const candidates = highs.map(h => h.price).filter(p => p > boundary && p < extreme);
+    return candidates.length ? Math.max(...candidates) : null;
+  } else {
+    const candidates = lows.map(l => l.price).filter(p => p < boundary && p > extreme);
+    return candidates.length ? Math.min(...candidates) : null;
+  }
+}
+
+// SL/TP-Berechnung nach Punkt 4/5 der Strategie-Vorgabe.
+function computeNySlTp(direction, entryPrice, extreme, range, candles) {
+  const boundary = direction === 'short' ? range.high : range.low;
+  const bufferPct = 0.0015;
+  const distToBoundaryPct = Math.abs(extreme - boundary) / boundary;
+
+  let stopLoss, slType;
+  if (distToBoundaryPct <= 0.015) {
+    stopLoss = direction === 'short' ? extreme * (1 + bufferPct) : extreme * (1 - bufferPct);
+    slType = 'extreme';
+  } else {
+    const pivot = findNyPivotBetween(candles, direction, boundary, extreme);
+    if (pivot != null) {
+      stopLoss = direction === 'short' ? pivot * (1 + bufferPct) : pivot * (1 - bufferPct);
+      slType = 'pivot';
+    } else {
+      stopLoss = direction === 'short' ? entryPrice * 1.01 : entryPrice * 0.99;
+      slType = 'fallback_1pct';
+    }
+  }
+
+  const slDistPct = Math.abs(entryPrice - stopLoss) / entryPrice;
+  const rrFactor = slDistPct >= 0.005 ? 2 : slDistPct >= 0.002 ? 3 : 4;
+  const takeProfit = direction === 'long'
+    ? entryPrice + (entryPrice - stopLoss) * rrFactor
+    : entryPrice - (stopLoss - entryPrice) * rrFactor;
+
+  return { stopLoss, takeProfit, slType, rrFactor, slDistPct };
+}
+
+async function checkNySymbol(symbol, settings) {
+  const candles = await fetchPaperCandles(symbol, '5m', 576); // ~48h Historie
+  const lastPrice = candles[candles.length - 1].close;
+  nyLastPrices[symbol] = lastPrice;
+
+  // Offene Trades auf SL/TP prüfen (kein Hebel-Liquidationsrisiko-Konzept
+  // in diesem Bot - fixe Slot-Margin ist die einzige Verlustgrenze pro Trade).
+  const { rows: openRows } = await pgPool.query("SELECT * FROM ny_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  for (const row of openRows) {
+    const trade = nyRowToTrade(row);
+    let closeReason = null;
+    if (trade.direction === 'long') {
+      if (lastPrice >= trade.takeProfit) closeReason = 'TP';
+      else if (lastPrice <= trade.stopLoss) closeReason = 'SL';
+    } else {
+      if (lastPrice <= trade.takeProfit) closeReason = 'TP';
+      else if (lastPrice >= trade.stopLoss) closeReason = 'SL';
+    }
+    if (!closeReason) continue;
+
+    const exitPrice = lastPrice;
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+
+    await pgPool.query(
+      `UPDATE ny_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`,
+      [exitPrice, closeReason, pnlEur, trade.id]
+    );
+    const { rows: balRows } = await pgPool.query(
+      'UPDATE ny_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur',
+      [pnlEur]
+    );
+    await pgPool.query('INSERT INTO ny_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+  }
+
+  const { rows: stillOpenForSymbol } = await pgPool.query(
+    "SELECT COUNT(*)::int AS c FROM ny_trades WHERE symbol = $1 AND status = 'open'", [symbol]
+  );
+  if (stillOpenForSymbol[0].c > 0) return; // pro Symbol max. 1 gleichzeitiger Trade
+
+  const range = computeNyRange(candles, 5 * 60 * 1000);
+  if (!range) return;
+
+  const setup = detectNyRangeSetup(candles, range);
+  if (!setup) return;
+
+  const plan = computeNySlTp(setup.direction, setup.entryPrice, setup.extreme, range, candles);
+
+  // Fester Kapitalschutz (Punkt "STRIKTER KAPITALSCHUTZ"): Margin pro Slot
+  // ist FEST (Start-Kapital / Anzahl Slots), nicht aus dem Risiko abgeleitet.
+  // Harte Grenze: Summe aller offenen Margins darf die aktuelle Balance nie
+  // übersteigen.
+  const marginEur = settings.startCapitalEur / settings.numSlots;
+  const { rows: usedRows } = await pgPool.query("SELECT COALESCE(SUM(margin_eur), 0) AS used FROM ny_trades WHERE status = 'open'");
+  const usedMarginEur = Number(usedRows[0].used);
+
+  const reasonText = `NY-Range ${range.low.toFixed(4)}-${range.high.toFixed(4)} (${range.date}), Ausbruch bis ${setup.extreme.toFixed(4)}, Rückkehr in Range bei ${setup.entryPrice.toFixed(4)} -> ${setup.direction === 'short' ? 'SHORT' : 'LONG'} gegen den Ausbruch. SL ${plan.slType === 'extreme' ? 'am Extrempunkt' : plan.slType === 'pivot' ? 'an lokalem Pivot' : 'Fallback 1%'}, TP-Faktor ${plan.rrFactor}x.`;
+
+  if (usedMarginEur + marginEur > settings.balanceEur) {
+    await pgPool.query(
+      `INSERT INTO ny_skipped_setups (id, symbol, direction, reason) VALUES ($1, $2, $3, $4)`,
+      [crypto.randomUUID(), symbol, setup.direction, `Kein freier Slot verfügbar (Margin ${marginEur.toFixed(2)}€ würde die Balance überschreiten). ${reasonText}`]
+    );
+    return;
+  }
+
+  const positionSizeEur = marginEur * settings.leverage;
+
+  await pgPool.query(
+    `INSERT INTO ny_trades (id, symbol, direction, entry_price, stop_loss, take_profit, sl_type, rr_factor, margin_eur, position_size_eur, leverage, range_high, range_low, breakout_extreme, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, plan.stopLoss, plan.takeProfit, plan.slType, plan.rrFactor, marginEur, positionSizeEur, settings.leverage, range.high, range.low, setup.extreme, reasonText]
+  );
+}
+
+async function runNyTradingCycle() {
+  if (!pgPool) return;
+  const settings = await getNySettings();
+  if (!settings.enabled) return;
+  for (const symbol of settings.watchedSymbols) {
+    try {
+      await checkNySymbol(symbol, settings);
+    } catch (err) {
+      console.error(`NY-Range-Bot-Fehler bei ${symbol}:`, err.message || err);
+    }
+  }
+  await pgPool.query('UPDATE ny_settings SET last_check = now() WHERE id = 1');
+}
+
+const NY_CHECK_INTERVAL_MS = 5 * 60 * 1000; // alle 5 Minuten (Strategie arbeitet auf 5m-Basis)
+setInterval(runNyTradingCycle, NY_CHECK_INTERVAL_MS);
+
+app.get('/api/ny-trading/state', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - NY Range Bot nicht verfügbar.' });
+  try {
+    const settings = await getNySettings();
+    const { rows: openRows } = await pgPool.query("SELECT * FROM ny_trades WHERE status = 'open' ORDER BY opened_at DESC");
+    const { rows: closedRows } = await pgPool.query("SELECT * FROM ny_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
+    const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM ny_balance_history ORDER BY time ASC');
+    const { rows: skippedRows } = await pgPool.query('SELECT * FROM ny_skipped_setups ORDER BY created_at DESC LIMIT 50');
+
+    const openTrades = openRows.map(nyRowToTrade).map(t => {
+      const currentPrice = nyLastPrices[t.symbol] ?? null;
+      let unrealizedPnlEur = null;
+      if (currentPrice != null) {
+        unrealizedPnlEur = t.direction === 'long'
+          ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
+          : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
+      }
+      return { ...t, currentPrice, unrealizedPnlEur };
+    });
+    const closedTrades = closedRows.map(nyRowToTrade);
+    const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
+    const skippedSetups = skippedRows.map(r => ({
+      id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime()
+    }));
+
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck });
+  } catch (err) {
+    console.error('NY Range Bot: state-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/ny-trading/settings', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - NY Range Bot nicht verfügbar.' });
+  try {
+    const incoming = req.body || {};
+    const current = await getNySettings();
+    const wasEnabled = current.enabled;
+    const next = {
+      enabled: !!incoming.enabled,
+      startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
+      numSlots: Number(incoming.numSlots) >= 1 ? Math.round(Number(incoming.numSlots)) : current.numSlots,
+      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
+      watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
+    };
+    await pgPool.query(
+      `UPDATE ny_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, watched_symbols = $5 WHERE id = 1`,
+      [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.watchedSymbols]
+    );
+    if (next.enabled && !wasEnabled) runNyTradingCycle();
+    res.json({ ok: true, settings: next });
+  } catch (err) {
+    console.error('NY Range Bot: settings-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/ny-trading/reset', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - NY Range Bot nicht verfügbar.' });
+  try {
+    const settings = await getNySettings();
+    await pgPool.query('DELETE FROM ny_trades');
+    await pgPool.query('DELETE FROM ny_balance_history');
+    await pgPool.query('DELETE FROM ny_skipped_setups');
+    await pgPool.query('UPDATE ny_settings SET balance_eur = $1, last_check = NULL WHERE id = 1', [settings.startCapitalEur]);
+    await pgPool.query('INSERT INTO ny_balance_history (balance) VALUES ($1)', [settings.startCapitalEur]);
+    Object.keys(nyLastPrices).forEach(k => delete nyLastPrices[k]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('NY Range Bot: reset-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
 const PORT = process.env.PORT || 5055;
 
 initPaperTradingSchema()
@@ -952,6 +1362,12 @@ initPaperTradingSchema()
     if (pgPool) console.log('Paper-Trading: Datenbank-Schema bereit.');
   })
   .catch(err => console.error('Paper-Trading: Schema-Initialisierung fehlgeschlagen:', err));
+
+initNyTradingSchema()
+  .then(() => {
+    if (pgPool) console.log('NY Range Bot: Datenbank-Schema bereit.');
+  })
+  .catch(err => console.error('NY Range Bot: Schema-Initialisierung fehlgeschlagen:', err));
 
 app.listen(PORT, () => {
   console.log(`Jarvis-Server läuft auf http://localhost:${PORT}`);
