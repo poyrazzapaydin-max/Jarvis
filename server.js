@@ -1474,6 +1474,459 @@ app.post('/api/ny-trading/close/:id', async (req, res) => {
   }
 });
 
+// ============================================================
+// SCALPING BOT - dritter, komplett unabhängiger Paper-Trading-Bot
+// (eigene Strategie, eigener Kapitalschutz, eigene DB-Tabellen "scalp_*").
+//
+// SICHERHEIT: Wie bei den anderen Bots - liest ausschließlich öffentliche
+// Binance-Kursdaten, verändert nur lokal simulierte Werte. Kein Codepfad
+// hier kann eine echte Order auslösen. NUR SIMULATION.
+//
+// STRATEGIE "Parabolic SAR + RSI Scalping" auf 5-Minuten-Basis:
+// 1) Parabolic SAR wechselt die Seite (Trendwechsel-Signal)
+// 2) RSI(14) bestätigt: entweder neutral (40-60) oder kommt gerade aus
+//    überverkauft/überkauft zurück (Kreuzung 30 bzw. 70)
+// 3) SL am letzten SAR-Punkt der vorherigen Trendrichtung, mindestens
+//    0,15% vom Einstieg entfernt. TP = 2x SL-Distanz (festes RR 1:2).
+// ============================================================
+const SCALP_DEFAULT_SETTINGS = {
+  enabled: false,
+  startCapitalEur: 100,
+  numSlots: 5,
+  leverage: 5
+};
+
+async function initScalpTradingSchema() {
+  if (!pgPool) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS scalp_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      start_capital_eur NUMERIC NOT NULL DEFAULT 100,
+      num_slots INTEGER NOT NULL DEFAULT 5,
+      leverage INTEGER NOT NULL DEFAULT 5,
+      balance_eur NUMERIC NOT NULL DEFAULT 100,
+      watched_symbols TEXT[] NOT NULL DEFAULT ARRAY['BTCUSDT','ETHUSDT','SOLUSDT'],
+      last_check TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS scalp_trades (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      entry_price NUMERIC NOT NULL,
+      stop_loss NUMERIC NOT NULL,
+      take_profit NUMERIC NOT NULL,
+      prior_sar NUMERIC NOT NULL,
+      rsi_at_entry NUMERIC NOT NULL,
+      margin_eur NUMERIC NOT NULL,
+      position_size_eur NUMERIC NOT NULL,
+      leverage INTEGER NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      opened_at TIMESTAMPTZ NOT NULL,
+      exit_price NUMERIC,
+      close_reason TEXT,
+      pnl_eur NUMERIC,
+      closed_at TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS scalp_balance_history (
+      id SERIAL PRIMARY KEY,
+      time TIMESTAMPTZ NOT NULL DEFAULT now(),
+      balance NUMERIC NOT NULL
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS scalp_skipped_setups (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      reason TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  const { rows } = await pgPool.query('SELECT id FROM scalp_settings WHERE id = 1');
+  if (!rows.length) {
+    await pgPool.query(
+      `INSERT INTO scalp_settings (id, enabled, start_capital_eur, num_slots, leverage, balance_eur, watched_symbols)
+       VALUES (1, false, $1, $2, $3, $1, $4)`,
+      [SCALP_DEFAULT_SETTINGS.startCapitalEur, SCALP_DEFAULT_SETTINGS.numSlots, SCALP_DEFAULT_SETTINGS.leverage,
+       ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT']]
+    );
+    await pgPool.query('INSERT INTO scalp_balance_history (balance) VALUES ($1)', [SCALP_DEFAULT_SETTINGS.startCapitalEur]);
+  }
+}
+
+function scalpRowToSettings(row) {
+  return {
+    enabled: row.enabled,
+    startCapitalEur: Number(row.start_capital_eur),
+    numSlots: Number(row.num_slots),
+    leverage: Number(row.leverage),
+    balanceEur: Number(row.balance_eur),
+    watchedSymbols: row.watched_symbols,
+    lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
+  };
+}
+
+async function getScalpSettings() {
+  const { rows } = await pgPool.query('SELECT * FROM scalp_settings WHERE id = 1');
+  return scalpRowToSettings(rows[0]);
+}
+
+function scalpRowToTrade(row) {
+  return {
+    id: row.id,
+    symbol: row.symbol,
+    direction: row.direction,
+    entryPrice: Number(row.entry_price),
+    stopLoss: Number(row.stop_loss),
+    takeProfit: Number(row.take_profit),
+    priorSar: Number(row.prior_sar),
+    rsiAtEntry: Number(row.rsi_at_entry),
+    marginEur: Number(row.margin_eur),
+    positionSizeEur: Number(row.position_size_eur),
+    leverage: Number(row.leverage),
+    reason: row.reason,
+    openedAt: new Date(row.opened_at).getTime(),
+    exitPrice: row.exit_price != null ? Number(row.exit_price) : null,
+    closeReason: row.close_reason,
+    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null,
+    closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null
+  };
+}
+
+const scalpLastPrices = {};
+
+// Standard-Parabolic-SAR (Wilder), Start/Increment/Max = 0.02/0.02/0.2.
+// Gibt pro Kerze { sar, isLong } zurück (isLong = SAR liegt unter dem Kurs,
+// also Aufwärtstrend-Zustand an dieser Kerze).
+function computeParabolicSAR(candles, step = 0.02, maxStep = 0.2) {
+  const n = candles.length;
+  const out = new Array(n).fill(null);
+  if (n < 3) return out;
+
+  let isLong = candles[1].close > candles[0].close;
+  let af = step;
+  let ep = isLong ? candles[0].high : candles[0].low;
+  let sar = isLong ? candles[0].low : candles[0].high;
+  out[0] = { sar, isLong };
+
+  for (let i = 1; i < n; i++) {
+    let nextSar = sar + af * (ep - sar);
+    if (isLong) {
+      const clampLow = Math.min(candles[i - 1].low, candles[i - 2] ? candles[i - 2].low : candles[i - 1].low);
+      nextSar = Math.min(nextSar, clampLow);
+      if (candles[i].low < nextSar) {
+        isLong = false;
+        nextSar = ep;
+        ep = candles[i].low;
+        af = step;
+      } else if (candles[i].high > ep) {
+        ep = candles[i].high;
+        af = Math.min(af + step, maxStep);
+      }
+    } else {
+      const clampHigh = Math.max(candles[i - 1].high, candles[i - 2] ? candles[i - 2].high : candles[i - 1].high);
+      nextSar = Math.max(nextSar, clampHigh);
+      if (candles[i].high > nextSar) {
+        isLong = true;
+        nextSar = ep;
+        ep = candles[i].high;
+        af = step;
+      } else if (candles[i].low < ep) {
+        ep = candles[i].low;
+        af = Math.min(af + step, maxStep);
+      }
+    }
+    sar = nextSar;
+    out[i] = { sar, isLong };
+  }
+  return out;
+}
+
+// RSI(14) als Zeitreihe (Wilder-Glättung), damit "kommt gerade aus
+// über-/unterverkauft zurück" über mehrere Kerzen hinweg geprüft werden kann.
+function computeRsiSeries(candles, period = 14) {
+  const closes = candles.map(c => c.close);
+  const out = new Array(closes.length).fill(null);
+  if (closes.length < period + 1) return out;
+  let gains = 0, losses = 0;
+  for (let i = 1; i <= period; i++) {
+    const diff = closes[i] - closes[i - 1];
+    if (diff >= 0) gains += diff; else losses -= diff;
+  }
+  let avgGain = gains / period, avgLoss = losses / period;
+  out[period] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  for (let i = period + 1; i < closes.length; i++) {
+    const diff = closes[i] - closes[i - 1];
+    const gain = diff > 0 ? diff : 0;
+    const loss = diff < 0 ? -diff : 0;
+    avgGain = (avgGain * (period - 1) + gain) / period;
+    avgLoss = (avgLoss * (period - 1) + loss) / period;
+    out[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
+  }
+  return out;
+}
+
+// Vereinfachte Heuristik. Erkennt SAR-Seitenwechsel an der letzten Kerze,
+// bestätigt durch RSI (neutral 40-60, oder Rückkehr aus über-/unterverkauft
+// in den letzten 5 Kerzen vor der Signalkerze).
+function detectScalpSetup(candles) {
+  const n = candles.length;
+  if (n < 20) return null;
+  const sarSeries = computeParabolicSAR(candles);
+  const rsiSeries = computeRsiSeries(candles);
+  const last = sarSeries[n - 1], prev = sarSeries[n - 2];
+  if (!last || !prev || last.isLong === prev.isLong) return null; // kein frischer Wechsel
+
+  const direction = last.isLong ? 'long' : 'short';
+  const rsiNow = rsiSeries[n - 1];
+  if (rsiNow == null) return null;
+
+  let rsiConfirms = false;
+  if (rsiNow >= 40 && rsiNow <= 60) {
+    rsiConfirms = true;
+  } else if (direction === 'long' && rsiNow > 30) {
+    for (let i = n - 6; i < n - 1; i++) {
+      if (i >= 0 && rsiSeries[i] != null && rsiSeries[i] < 30) { rsiConfirms = true; break; }
+    }
+  } else if (direction === 'short' && rsiNow < 70) {
+    for (let i = n - 6; i < n - 1; i++) {
+      if (i >= 0 && rsiSeries[i] != null && rsiSeries[i] > 70) { rsiConfirms = true; break; }
+    }
+  }
+  if (!rsiConfirms) return null;
+
+  return { direction, priorSar: prev.sar, rsi: rsiNow, entryPrice: candles[n - 1].close };
+}
+
+// SL am letzten SAR-Punkt der vorherigen Trendrichtung, Mindestabstand 0,15%.
+// TP = festes RR 1:2.
+function computeScalpSlTp(direction, entryPrice, priorSar) {
+  const minDistPct = 0.0015;
+  let stopLoss = priorSar;
+  const rawDistPct = Math.abs(entryPrice - stopLoss) / entryPrice;
+  if (rawDistPct < minDistPct) {
+    stopLoss = direction === 'long' ? entryPrice * (1 - minDistPct) : entryPrice * (1 + minDistPct);
+  }
+  const distance = Math.abs(entryPrice - stopLoss);
+  const takeProfit = direction === 'long' ? entryPrice + distance * 2 : entryPrice - distance * 2;
+  return { stopLoss, takeProfit };
+}
+
+async function checkScalpSymbol(symbol, settings) {
+  const candles = await fetchPaperCandles(symbol, '5m', 200);
+  const lastPrice = candles[candles.length - 1].close;
+  scalpLastPrices[symbol] = lastPrice;
+
+  const { rows: openRows } = await pgPool.query("SELECT * FROM scalp_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  for (const row of openRows) {
+    const trade = scalpRowToTrade(row);
+    let closeReason = null;
+    if (trade.direction === 'long') {
+      if (lastPrice >= trade.takeProfit) closeReason = 'TP';
+      else if (lastPrice <= trade.stopLoss) closeReason = 'SL';
+    } else {
+      if (lastPrice <= trade.takeProfit) closeReason = 'TP';
+      else if (lastPrice >= trade.stopLoss) closeReason = 'SL';
+    }
+    if (!closeReason) continue;
+
+    const exitPrice = lastPrice;
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+
+    await pgPool.query(
+      `UPDATE scalp_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`,
+      [exitPrice, closeReason, pnlEur, trade.id]
+    );
+    const { rows: balRows } = await pgPool.query(
+      'UPDATE scalp_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur',
+      [pnlEur]
+    );
+    await pgPool.query('INSERT INTO scalp_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+  }
+
+  const { rows: stillOpenForSymbol } = await pgPool.query(
+    "SELECT COUNT(*)::int AS c FROM scalp_trades WHERE symbol = $1 AND status = 'open'", [symbol]
+  );
+  if (stillOpenForSymbol[0].c > 0) return;
+
+  const setup = detectScalpSetup(candles);
+  if (!setup) return;
+
+  const plan = computeScalpSlTp(setup.direction, setup.entryPrice, setup.priorSar);
+
+  // Fester Kapitalschutz, identisch zum NY Range Bot: feste Margin pro Slot,
+  // harte Grenze über alle offenen Trades hinweg gegen die aktuelle Balance.
+  const marginEur = settings.startCapitalEur / settings.numSlots;
+  const { rows: usedRows } = await pgPool.query("SELECT COALESCE(SUM(margin_eur), 0) AS used FROM scalp_trades WHERE status = 'open'");
+  const usedMarginEur = Number(usedRows[0].used);
+
+  const reasonText = `Parabolic-SAR-Wechsel zu ${setup.direction === 'long' ? 'Aufwärtstrend' : 'Abwärtstrend'} (letzter SAR der Vorphase: ${setup.priorSar.toFixed(4)}), RSI(14) bei ${setup.rsi.toFixed(1)} bestätigt.`;
+
+  if (usedMarginEur + marginEur > settings.balanceEur) {
+    await pgPool.query(
+      `INSERT INTO scalp_skipped_setups (id, symbol, direction, reason) VALUES ($1, $2, $3, $4)`,
+      [crypto.randomUUID(), symbol, setup.direction, `Kein freier Slot verfügbar (Margin ${marginEur.toFixed(2)}€ würde die Balance überschreiten). ${reasonText}`]
+    );
+    return;
+  }
+
+  const positionSizeEur = marginEur * settings.leverage;
+
+  await pgPool.query(
+    `INSERT INTO scalp_trades (id, symbol, direction, entry_price, stop_loss, take_profit, prior_sar, rsi_at_entry, margin_eur, position_size_eur, leverage, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, plan.stopLoss, plan.takeProfit, setup.priorSar, setup.rsi, marginEur, positionSizeEur, settings.leverage, reasonText]
+  );
+}
+
+async function runScalpTradingCycle() {
+  if (!pgPool) return;
+  const settings = await getScalpSettings();
+  if (!settings.enabled) return;
+  for (const symbol of settings.watchedSymbols) {
+    try {
+      await checkScalpSymbol(symbol, settings);
+    } catch (err) {
+      console.error(`Scalping-Bot-Fehler bei ${symbol}:`, err.message || err);
+    }
+    await sleep(150);
+  }
+  await pgPool.query('UPDATE scalp_settings SET last_check = now() WHERE id = 1');
+}
+
+// 90 Sekunden: zwischen den 2 Minuten der anderen Bots und dem theoretisch
+// möglichen Minimum. 5m-Kerzen liefern ohnehin nur alle 5 Minuten ein neues
+// abgeschlossenes Signal, häufiger als ~1-2 Min zu prüfen brächte keine
+// zusätzlichen Signale, nur mehr Last. 90s liegt in der gewünschten
+// 1-2-Minuten-Spanne und bleibt zusammen mit den anderen zwei Bots (2 Min,
+// 33 statt 35 Coins, 150ms-Pause pro Coin) im Rahmen, der die Binance-
+// IP-Sperre von vorhin ausgelöst hat, um das nicht zu wiederholen.
+const SCALP_CHECK_INTERVAL_MS = 90 * 1000;
+setInterval(runScalpTradingCycle, SCALP_CHECK_INTERVAL_MS);
+
+app.get('/api/scalp-trading/state', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Scalping Bot nicht verfügbar.' });
+  try {
+    const settings = await getScalpSettings();
+    const { rows: openRows } = await pgPool.query("SELECT * FROM scalp_trades WHERE status = 'open' ORDER BY opened_at DESC");
+    const { rows: closedRows } = await pgPool.query("SELECT * FROM scalp_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
+    const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM scalp_balance_history ORDER BY time ASC');
+    const { rows: skippedRows } = await pgPool.query('SELECT * FROM scalp_skipped_setups ORDER BY created_at DESC LIMIT 50');
+
+    const openTrades = openRows.map(scalpRowToTrade).map(t => {
+      const currentPrice = scalpLastPrices[t.symbol] ?? null;
+      let unrealizedPnlEur = null;
+      if (currentPrice != null) {
+        unrealizedPnlEur = t.direction === 'long'
+          ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
+          : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
+      }
+      return { ...t, currentPrice, unrealizedPnlEur };
+    });
+    const closedTrades = closedRows.map(scalpRowToTrade);
+    const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
+    const skippedSetups = skippedRows.map(r => ({
+      id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime()
+    }));
+
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: SCALP_CHECK_INTERVAL_MS });
+  } catch (err) {
+    console.error('Scalping Bot: state-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/scalp-trading/settings', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Scalping Bot nicht verfügbar.' });
+  try {
+    const incoming = req.body || {};
+    const current = await getScalpSettings();
+    const wasEnabled = current.enabled;
+    const next = {
+      enabled: !!incoming.enabled,
+      startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
+      numSlots: Number(incoming.numSlots) >= 1 ? Math.round(Number(incoming.numSlots)) : current.numSlots,
+      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
+      watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
+    };
+    await pgPool.query(
+      `UPDATE scalp_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, watched_symbols = $5 WHERE id = 1`,
+      [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.watchedSymbols]
+    );
+    if (next.enabled && !wasEnabled) runScalpTradingCycle();
+    res.json({ ok: true, settings: next });
+  } catch (err) {
+    console.error('Scalping Bot: settings-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/scalp-trading/reset', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Scalping Bot nicht verfügbar.' });
+  try {
+    const settings = await getScalpSettings();
+    await pgPool.query('DELETE FROM scalp_trades');
+    await pgPool.query('DELETE FROM scalp_balance_history');
+    await pgPool.query('DELETE FROM scalp_skipped_setups');
+    await pgPool.query('UPDATE scalp_settings SET balance_eur = $1, last_check = NULL WHERE id = 1', [settings.startCapitalEur]);
+    await pgPool.query('INSERT INTO scalp_balance_history (balance) VALUES ($1)', [settings.startCapitalEur]);
+    Object.keys(scalpLastPrices).forEach(k => delete scalpLastPrices[k]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Scalping Bot: reset-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/scalp-trading/close/:id', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Scalping Bot nicht verfügbar.' });
+  try {
+    const { rows } = await pgPool.query("SELECT * FROM scalp_trades WHERE id = $1 AND status = 'open'", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Offener Trade nicht gefunden.' });
+    const trade = scalpRowToTrade(rows[0]);
+
+    let exitPrice, usedLastKnownPrice = false;
+    try {
+      exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol);
+    } catch (err) {
+      const cached = scalpLastPrices[trade.symbol];
+      if (cached == null) {
+        return res.status(503).json({ error: `Aktueller Kurs für ${trade.symbol} nicht abrufbar (${err.message}) und kein zwischengespeicherter Preis vorhanden. Bitte später erneut versuchen.` });
+      }
+      exitPrice = cached;
+      usedLastKnownPrice = true;
+    }
+
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+
+    await pgPool.query(
+      `UPDATE scalp_trades SET status = 'closed', exit_price = $1, close_reason = 'MANUAL', pnl_eur = $2, closed_at = now() WHERE id = $3`,
+      [exitPrice, pnlEur, trade.id]
+    );
+    const { rows: balRows } = await pgPool.query(
+      'UPDATE scalp_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur',
+      [pnlEur]
+    );
+    await pgPool.query('INSERT INTO scalp_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+
+    res.json({ ok: true, exitPrice, pnlEur, usedLastKnownPrice });
+  } catch (err) {
+    console.error('Scalping Bot: manuelles Schließen fehlgeschlagen:', err);
+    res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
+  }
+});
+
 const PORT = process.env.PORT || 5055;
 
 initPaperTradingSchema()
@@ -1487,6 +1940,12 @@ initNyTradingSchema()
     if (pgPool) console.log('NY Range Bot: Datenbank-Schema bereit.');
   })
   .catch(err => console.error('NY Range Bot: Schema-Initialisierung fehlgeschlagen:', err));
+
+initScalpTradingSchema()
+  .then(() => {
+    if (pgPool) console.log('Scalping Bot: Datenbank-Schema bereit.');
+  })
+  .catch(err => console.error('Scalping Bot: Schema-Initialisierung fehlgeschlagen:', err));
 
 app.listen(PORT, () => {
   console.log(`Jarvis-Server läuft auf http://localhost:${PORT}`);

@@ -3381,6 +3381,9 @@
         <div class="nav-item" data-view="nybot">
           <span class="icon">🗽</span> NY Range Bot
         </div>
+        <div class="nav-item" data-view="scalpbot">
+          <span class="icon">⚡</span> Scalping Bot
+        </div>
         <div class="nav-item" data-view="analyse">
           <span class="icon">🧠</span> Analyse
         </div>
@@ -3855,6 +3858,77 @@
         </div>
       </div>
 
+      <!-- Scalping Bot view (dritter, unabhängiger Paper-Trading-Bot) -->
+      <div class="view-flex-col" id="view-scalpbot" style="display:none;">
+        <div class="portfolio-header">
+          <div>
+            <div class="view-panel-title">SCALPING BOT</div>
+            <div class="portfolio-claim">Parabolic SAR + RSI — Simulation</div>
+          </div>
+          <button class="mini-toggle-btn off" id="scalpEnableToggle">🔴 SIMULATION AUS</button>
+        </div>
+
+        <div class="at-sim-banner">⚠ SIMULATION — kein echtes Geld im Einsatz. Es werden keine echten MEXC-Orders ausgeführt.</div>
+        <div class="at-update-row">
+          <span class="mono" id="scalpUpdateInfo">—</span>
+          <span class="at-countdown-row mono" id="scalpCountdownRow">Nächste Prüfung in: —</span>
+          <span class="at-save-toast" id="scalpSaveToast">Einstellungen gespeichert ✓</span>
+        </div>
+
+        <div class="news-body">
+
+          <div class="panel-card">
+            <div class="panel-title">REGELWERK</div>
+            <div class="at-settings-grid">
+              <label>Start-Kapital (€)<input type="number" step="1" min="1" class="select-input" id="scalpStartCapital"></label>
+              <label>Anzahl fester Slots<input type="number" step="1" min="1" max="20" class="select-input" id="scalpSlots"></label>
+              <label>Hebel (1x - 10x)<input type="number" step="1" min="1" max="10" class="select-input" id="scalpLeverage"></label>
+            </div>
+            <div class="panel-title" style="margin-top:14px;">BEOBACHTETE COINS</div>
+            <div class="at-coin-select" id="scalpCoinSelect"></div>
+            <div class="quick-action-row" style="margin-top:14px;">
+              <button class="big-analyze-btn" id="scalpSaveSettingsBtn" style="padding:11px 24px; font-size:0.8rem;">Einstellungen speichern</button>
+              <button class="quick-action-btn danger" id="scalpResetBtn">⟲ Simulation zurücksetzen</button>
+            </div>
+            <div class="trades-range-info mono" id="scalpLastCheckInfo"></div>
+          </div>
+
+          <div class="portfolio-stats-row">
+            <div class="stat-box"><div class="stat-label">PAPER-BALANCE</div><div class="stat-value mono" id="scalpBalance">--</div></div>
+            <div class="stat-box"><div class="stat-label">GESAMTERGEBNIS</div><div class="stat-value mono" id="scalpTotalResult">--</div></div>
+            <div class="stat-box"><div class="stat-label">TRADES GESAMT</div><div class="stat-value mono" id="scalpTradeCount">--</div></div>
+            <div class="stat-box"><div class="stat-label">GEWINNRATE</div><div class="stat-value mono" id="scalpWinRate">--</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">PAPER-BALANCE-VERLAUF</div>
+            <div class="portfolio-chart-wrap" style="height:180px;">
+              <canvas id="scalpBalanceChart" width="900" height="180"></canvas>
+              <div class="chart-placeholder-msg" id="scalpChartPlaceholder">Noch keine Verlaufsdaten.</div>
+            </div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">OFFENE PAPER-POSITIONEN</div>
+            <div class="at-total-pnl-row" id="scalpOpenTotalPnl" style="display:none;">
+              Unrealisierter Gesamt-PnL: <span class="mono" id="scalpOpenTotalPnlValue">--</span>
+            </div>
+            <div class="trade-list" id="scalpOpenList"><div class="notes-empty">Keine offenen Positionen.</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">GESCHLOSSENE PAPER-TRADES</div>
+            <div class="trade-list" id="scalpClosedList"><div class="notes-empty">Noch keine geschlossenen Trades.</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">ÜBERSPRUNGENE SETUPS <span class="card-title-hint">— erkannt, aber kein freier Slot</span></div>
+            <div class="trade-list" id="scalpSkippedList"><div class="notes-empty">Noch keine übersprungenen Setups.</div></div>
+          </div>
+
+        </div>
+      </div>
+
       <!-- Analyse view (Market Intelligence, full page) -->
       <div class="view-flex-col analyse-view" id="view-analyse" style="display:none;">
         <div class="analyse-hero">
@@ -4246,6 +4320,7 @@
     portfolio: 'Portfolio',
     autotrader: 'Auto Trader',
     nybot: 'NY Range Bot',
+    scalpbot: 'Scalping Bot',
     analyse: 'Analyse',
     news: 'News',
     aicore: 'AI Core',
@@ -4261,6 +4336,7 @@
     portfolio: document.getElementById('view-portfolio'),
     autotrader: document.getElementById('view-autotrader'),
     nybot: document.getElementById('view-nybot'),
+    scalpbot: document.getElementById('view-scalpbot'),
     analyse: document.getElementById('view-analyse'),
     news: document.getElementById('view-news'),
     aicore: document.getElementById('view-aicore'),
@@ -4294,6 +4370,9 @@
     }
     if (key === 'nybot' && typeof loadNyBotState === 'function') {
       loadNyBotState();
+    }
+    if (key === 'scalpbot' && typeof loadScalpBotState === 'function') {
+      loadScalpBotState();
     }
   }
 
@@ -7848,6 +7927,342 @@
   setInterval(() => {
     if (viewPanels.nybot && viewPanels.nybot.style.display !== 'none') {
       loadNyBotState();
+    }
+  }, 30000);
+
+  // ============ SCALPING BOT (dritter, unabhängiger Paper-Trading-Bot) ============
+  // Ruft ausschließlich den eigenen Backend-Endpoint auf, der wiederum nur
+  // öffentliche Binance-Kursdaten liest. Kein Aufruf hier kann eine echte
+  // MEXC-Order auslösen.
+  let scalpSelectedSymbols = [];
+  let scalpLastOpenTrades = [];
+
+  document.getElementById('scalpOpenList').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-action]');
+    if (!btn) return;
+    const trade = scalpLastOpenTrades.find(t => t.id === btn.dataset.id);
+    if (!trade) return;
+    if (btn.dataset.action === 'chart') {
+      openChart(trade.symbol, trade.symbol.replace('USDT', '/USDT'), { entry: trade.entryPrice, sl: trade.stopLoss, tp: trade.takeProfit });
+    } else if (btn.dataset.action === 'close') {
+      if (!confirm(`${trade.symbol.replace('USDT', '/USDT')}-Trade wirklich schließen? Wird zum aktuellen Marktpreis abgerechnet.`)) return;
+      btn.disabled = true;
+      fetch(`/api/scalp-trading/close/${trade.id}`, { method: 'POST' })
+        .then(r => r.json())
+        .then(res => {
+          if (res.error) { alert(res.error); btn.disabled = false; return; }
+          if (res.usedLastKnownPrice) {
+            alert(`Hinweis: Live-Kurs für ${trade.symbol} nicht abrufbar - Trade wurde mit dem letzten bekannten Preis (${res.exitPrice}) geschlossen, nicht dem allerneuesten Kurs.`);
+          }
+          addFeedEntry(`Scalping-Bot-Trade ${trade.symbol} manuell geschlossen`);
+          loadScalpBotState();
+        })
+        .catch(() => { btn.disabled = false; });
+    }
+  });
+
+  function scalpCoinChipsHtml() {
+    return AUTO_TRADER_SYMBOLS.map(sym => {
+      const active = scalpSelectedSymbols.includes(sym);
+      return `<span class="at-coin-chip${active ? ' active' : ''}" data-sym="${sym}">${sym.replace('USDT', '/USDT')}</span>`;
+    }).join('');
+  }
+
+  function scalpRenderCoinChips() {
+    const el = document.getElementById('scalpCoinSelect');
+    if (!el) return;
+    el.innerHTML = scalpCoinChipsHtml();
+    el.querySelectorAll('.at-coin-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        const sym = chip.dataset.sym;
+        if (scalpSelectedSymbols.includes(sym)) {
+          scalpSelectedSymbols = scalpSelectedSymbols.filter(s => s !== sym);
+        } else {
+          scalpSelectedSymbols.push(sym);
+        }
+        scalpRenderCoinChips();
+      });
+    });
+  }
+
+  function scalpSkippedRowHtml(s) {
+    const dirClass = s.direction === 'long' ? 'long' : 'short';
+    const dirLabel = s.direction === 'long' ? 'LONG' : 'SHORT';
+    const time = new Date(s.createdAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    return `<div class="trade-row">
+      <div class="trade-row-top">
+        <span class="trade-sym">${escapeHtml(s.symbol.replace('USDT', '/USDT'))}</span>
+        <span class="trade-dir ${dirClass}">${dirLabel}</span>
+      </div>
+      <div class="trade-row-bottom">
+        <span class="trade-time mono">${time} · ${escapeHtml(s.reason || '')}</span>
+      </div>
+    </div>`;
+  }
+
+  function scalpTradeRowHtml(t, isOpen) {
+    const dirClass = t.direction === 'long' ? 'long' : 'short';
+    const dirLabel = t.direction === 'long' ? 'LONG' : 'SHORT';
+    const pnl = isOpen ? t.unrealizedPnlEur : t.pnlEur;
+    const pnlText = (pnl == null) ? '--' : `${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}€`;
+    const pnlColorCls = pnl == null ? '' : pnlColorClass(pnl);
+    const time = new Date(isOpen ? t.openedAt : t.closedAt).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+    const extras = computeTradeExtras(t, isOpen ? t.currentPrice : null);
+    const tpSlProjection = isOpen
+      ? `<div class="at-tp-sl-projection"><span class="pnl-color-up">Bei TP: +${extras.tpProfitEur.toFixed(2)}€</span><span class="pnl-color-down">Bei SL: ${extras.slLossEur.toFixed(2)}€</span></div>`
+      : '';
+    const distanceRow = (isOpen && extras.pctToSl != null)
+      ? `<div class="at-distance-row"><span>SL in ${extras.pctToSl.toFixed(2)}%</span><span>TP in ${extras.pctToTp.toFixed(2)}%</span></div>`
+      : '';
+
+    const gridItems = [
+      ['Letzter SAR (Vorphase)', formatAutoPrice(t.priorSar)],
+      ['RSI bei Einstieg', t.rsiAtEntry.toFixed(1)],
+      isOpen ? ['Einstieg → Aktuell', `${formatAutoPrice(t.entryPrice)} → ${t.currentPrice != null ? formatAutoPrice(t.currentPrice) : '--'}`] : ['Einstieg → Exit', `${formatAutoPrice(t.entryPrice)} → ${formatAutoPrice(t.exitPrice)}`],
+      ['Stop-Loss', formatAutoPrice(t.stopLoss)],
+      ['Take-Profit', formatAutoPrice(t.takeProfit)],
+      ['Margin', `${t.marginEur.toFixed(2)}€`],
+      ['Positionsgröße', `${t.positionSizeEur.toFixed(2)}€`]
+    ];
+    if (!isOpen) gridItems.push(['Grund', closeReasonLabel(t.closeReason)]);
+    const gridHtml = gridItems.map(([label, value]) => `
+      <div class="at-trade-grid-item">
+        <span class="at-trade-grid-label">${escapeHtml(label)}</span>
+        <span class="at-trade-grid-value">${escapeHtml(String(value))}</span>
+      </div>`).join('');
+
+    const actions = isOpen
+      ? `<div class="at-trade-actions">
+          <button class="at-trade-action-btn" data-action="chart" data-id="${t.id}">📈 Chart</button>
+          <button class="at-trade-action-btn danger" data-action="close" data-id="${t.id}">✕ Trade schließen</button>
+        </div>`
+      : '';
+
+    return `<div class="trade-row">
+      <div class="trade-row-top">
+        <span class="trade-sym">${escapeHtml(t.symbol.replace('USDT', '/USDT'))}</span>
+        <span class="trade-dir ${dirClass}">${dirLabel} · ${t.leverage}x</span>
+      </div>
+      <div class="at-trade-grid">${gridHtml}</div>
+      ${tpSlProjection}
+      ${distanceRow}
+      <div class="trade-row-bottom">
+        <span class="trade-time mono">${time}</span>
+        <span class="trade-pnl-big mono ${pnlColorCls}">${pnlText}</span>
+      </div>
+      ${actions}
+      <details class="at-trade-details">
+        <summary>Details (Erkennungsgrund)</summary>
+        <div class="at-trade-details-text">${escapeHtml(t.reason || '')}</div>
+      </details>
+    </div>`;
+  }
+
+  function scalpDrawBalanceChart(history) {
+    const canvas = document.getElementById('scalpBalanceChart');
+    const placeholder = document.getElementById('scalpChartPlaceholder');
+    if (!canvas) return;
+    if (!history || history.length < 2) {
+      placeholder.classList.add('show');
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+    placeholder.classList.remove('show');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, rect.width, rect.height);
+
+    const values = history.map(p => p.balance);
+    const min = Math.min(...values), max = Math.max(...values);
+    const range = (max - min) || 1;
+    const padTop = 10, padBottom = 10;
+    const usableH = rect.height - padTop - padBottom;
+    const stepX = history.length > 1 ? rect.width / (history.length - 1) : rect.width;
+    const coords = history.map((p, i) => ({ x: i * stepX, y: padTop + usableH - ((p.balance - min) / range) * usableH }));
+
+    const isUp = values[values.length - 1] >= values[0];
+    const lineColor = isUp ? '#34e29a' : '#ff5c72';
+
+    ctx.beginPath();
+    ctx.moveTo(coords[0].x, rect.height);
+    coords.forEach(c => ctx.lineTo(c.x, c.y));
+    ctx.lineTo(coords[coords.length - 1].x, rect.height);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, 0, 0, rect.height);
+    grad.addColorStop(0, isUp ? 'rgba(52,226,154,0.18)' : 'rgba(255,92,114,0.18)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    ctx.beginPath();
+    coords.forEach((c, i) => i === 0 ? ctx.moveTo(c.x, c.y) : ctx.lineTo(c.x, c.y));
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+  }
+
+  async function loadScalpBotState() {
+    try {
+      const res = await fetch('/api/scalp-trading/state');
+      const data = await res.json();
+
+      if (!res.ok || !data.settings) {
+        const openEl = document.getElementById('scalpOpenList');
+        if (openEl) openEl.innerHTML = `<div class="notes-empty">${escapeHtml(data.error || 'Scalping Bot nicht verfügbar.')}</div>`;
+        return;
+      }
+
+      scalpSelectedSymbols = data.settings.watchedSymbols.slice();
+      scalpRenderCoinChips();
+
+      document.getElementById('scalpStartCapital').value = data.settings.startCapitalEur;
+      document.getElementById('scalpSlots').value = data.settings.numSlots;
+      document.getElementById('scalpLeverage').value = data.settings.leverage;
+
+      const toggleBtn = document.getElementById('scalpEnableToggle');
+      toggleBtn.classList.toggle('on', data.settings.enabled);
+      toggleBtn.classList.toggle('off', !data.settings.enabled);
+      toggleBtn.textContent = data.settings.enabled ? '🟢 SIMULATION AN' : '🔴 SIMULATION AUS';
+
+      const balance = data.balanceEur;
+      const start = data.settings.startCapitalEur;
+      const resultEur = balance - start;
+      const resultPct = start ? (resultEur / start) * 100 : 0;
+      document.getElementById('scalpBalance').textContent = `${balance.toFixed(2)}€`;
+      const resultEl = document.getElementById('scalpTotalResult');
+      resultEl.textContent = `${resultEur >= 0 ? '+' : ''}${resultEur.toFixed(2)}€ (${resultPct >= 0 ? '+' : ''}${resultPct.toFixed(1)}%)`;
+      resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
+
+      const closed = data.closedTrades || [];
+      document.getElementById('scalpTradeCount').textContent = String(closed.length);
+      const wins = closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('scalpWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+
+      scalpDrawBalanceChart(data.balanceHistory);
+
+      const openEl = document.getElementById('scalpOpenList');
+      const openTrades = data.openTrades || [];
+      scalpLastOpenTrades = openTrades;
+      openEl.innerHTML = openTrades.length
+        ? openTrades.map(t => scalpTradeRowHtml(t, true)).join('')
+        : '<div class="notes-empty">Keine offenen Positionen.</div>';
+
+      const totalPnlRow = document.getElementById('scalpOpenTotalPnl');
+      const totalPnlValue = document.getElementById('scalpOpenTotalPnlValue');
+      if (totalPnlRow && totalPnlValue) {
+        if (openTrades.length) {
+          const totalPnl = openTrades.reduce((sum, t) => sum + (t.unrealizedPnlEur || 0), 0);
+          totalPnlValue.textContent = `${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}€`;
+          totalPnlValue.className = 'mono trade-pnl-big ' + pnlColorClass(totalPnl);
+          totalPnlRow.style.display = 'block';
+        } else {
+          totalPnlRow.style.display = 'none';
+        }
+      }
+
+      const closedEl = document.getElementById('scalpClosedList');
+      closedEl.innerHTML = closed.length
+        ? closed.map(t => scalpTradeRowHtml(t, false)).join('')
+        : '<div class="notes-empty">Noch keine geschlossenen Trades.</div>';
+
+      const skippedEl = document.getElementById('scalpSkippedList');
+      if (skippedEl) {
+        const skipped = data.skippedSetups || [];
+        skippedEl.innerHTML = skipped.length
+          ? skipped.map(scalpSkippedRowHtml).join('')
+          : '<div class="notes-empty">Noch keine übersprungenen Setups.</div>';
+      }
+
+      const lastCheckEl = document.getElementById('scalpLastCheckInfo');
+      if (lastCheckEl) {
+        lastCheckEl.textContent = data.lastCheck
+          ? `Letzte Prüfung: ${new Date(data.lastCheck).toLocaleString('de-DE')}`
+          : 'Noch keine Prüfung durchgeführt.';
+      }
+
+      scalpLastLoadTime = Date.now();
+      scalpNextCheckAt = data.lastCheck && data.checkIntervalMs ? data.lastCheck + data.checkIntervalMs : null;
+      updateScalpUpdateInfo();
+    } catch (err) {
+      console.error('Scalping Bot: Laden fehlgeschlagen', err);
+    }
+  }
+
+  async function scalpSaveSettings(enabledOverride) {
+    const toggleBtn = document.getElementById('scalpEnableToggle');
+    const enabled = enabledOverride !== undefined ? enabledOverride : toggleBtn.classList.contains('on');
+    const body = {
+      enabled,
+      startCapitalEur: parseFloat(document.getElementById('scalpStartCapital').value),
+      numSlots: parseInt(document.getElementById('scalpSlots').value, 10),
+      leverage: parseInt(document.getElementById('scalpLeverage').value, 10),
+      watchedSymbols: scalpSelectedSymbols
+    };
+    await fetch('/api/scalp-trading/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    addFeedEntry('Scalping-Bot-Einstellungen gespeichert');
+    loadScalpBotState();
+  }
+
+  function showScalpSaveToast() {
+    const toast = document.getElementById('scalpSaveToast');
+    if (!toast) return;
+    toast.classList.add('show');
+    clearTimeout(showScalpSaveToast._t);
+    showScalpSaveToast._t = setTimeout(() => toast.classList.remove('show'), 2500);
+  }
+
+  document.getElementById('scalpEnableToggle').addEventListener('click', () => {
+    const btn = document.getElementById('scalpEnableToggle');
+    const nowEnabled = !btn.classList.contains('on');
+    scalpSaveSettings(nowEnabled);
+  });
+
+  document.getElementById('scalpSaveSettingsBtn').addEventListener('click', () => {
+    scalpSaveSettings();
+    showScalpSaveToast();
+  });
+
+  document.getElementById('scalpResetBtn').addEventListener('click', async () => {
+    if (!confirm('Scalping-Bot-Simulation wirklich zurücksetzen? Balance-Verlauf und alle offenen/geschlossenen Paper-Trades werden gelöscht.')) return;
+    await fetch('/api/scalp-trading/reset', { method: 'POST' });
+    addFeedEntry('Scalping-Bot-Simulation zurückgesetzt');
+    loadScalpBotState();
+  });
+
+  let scalpLastLoadTime = null;
+  let scalpNextCheckAt = null;
+  function updateScalpUpdateInfo() {
+    const el = document.getElementById('scalpUpdateInfo');
+    if (el && scalpLastLoadTime) {
+      const secs = Math.round((Date.now() - scalpLastLoadTime) / 1000);
+      el.textContent = secs < 2 ? 'Gerade aktualisiert' : `Aktualisiert vor ${secs}s`;
+    }
+    const cdEl = document.getElementById('scalpCountdownRow');
+    if (cdEl) {
+      if (scalpNextCheckAt) {
+        const remainingSecs = Math.round((scalpNextCheckAt - Date.now()) / 1000);
+        cdEl.textContent = remainingSecs > 0 ? `Nächste Prüfung in: ${remainingSecs}s` : 'Nächste Prüfung: läuft gerade…';
+      } else {
+        cdEl.textContent = 'Nächste Prüfung in: —';
+      }
+    }
+  }
+  setInterval(updateScalpUpdateInfo, 1000);
+
+  setInterval(() => {
+    if (viewPanels.scalpbot && viewPanels.scalpbot.style.display !== 'none') {
+      loadScalpBotState();
     }
   }, 30000);
 
