@@ -1927,6 +1927,667 @@ app.post('/api/scalp-trading/close/:id', async (req, res) => {
   }
 });
 
+// ============================================================
+// FVG BOT - vierter, komplett unabhängiger Paper-Trading-Bot
+// (eigene Strategie, eigener Kapitalschutz, eigene DB-Tabellen "fvg_*").
+//
+// SICHERHEIT: Wie bei den anderen Bots - liest ausschließlich öffentliche
+// Binance-Kursdaten, verändert nur lokal simulierte Werte. NUR SIMULATION.
+//
+// STRATEGIE "Fair Value Gap" auf 5-Minuten-Basis:
+// 1) 3-Kerzen-FVG: bullisch wenn Hoch(K1) < Tief(K3), bearisch gespiegelt.
+// 2) Kehrt der Kurs innerhalb von 20 Kerzen wieder in die Gap-Zone zurück,
+//    wird ein Trade in Richtung der ursprünglichen Gap-Bewegung eröffnet
+//    (bullische Gap -> Long, bearische Gap -> Short).
+// 3) SL an der GEGENÜBERLIEGENDEN (fernen) Kante der Gap-Zone (vom Nutzer
+//    im Chat explizit bestätigt, da die Formulierung im Auftrag intern
+//    widersprüchlich war), Mindestabstand 0,15%. TP = konfigurierbares
+//    RR-Verhältnis (Standard 1:3).
+// ============================================================
+const FVG_DEFAULT_SETTINGS = { enabled: false, startCapitalEur: 100, numSlots: 5, leverage: 5, riskRewardRatio: 3 };
+
+async function initFvgTradingSchema() {
+  if (!pgPool) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS fvg_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      start_capital_eur NUMERIC NOT NULL DEFAULT 100,
+      num_slots INTEGER NOT NULL DEFAULT 5,
+      leverage INTEGER NOT NULL DEFAULT 5,
+      risk_reward_ratio NUMERIC NOT NULL DEFAULT 3,
+      balance_eur NUMERIC NOT NULL DEFAULT 100,
+      watched_symbols TEXT[] NOT NULL DEFAULT ARRAY['BTCUSDT','ETHUSDT','SOLUSDT'],
+      last_check TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS fvg_trades (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      entry_price NUMERIC NOT NULL,
+      stop_loss NUMERIC NOT NULL,
+      take_profit NUMERIC NOT NULL,
+      gap_low NUMERIC NOT NULL,
+      gap_high NUMERIC NOT NULL,
+      margin_eur NUMERIC NOT NULL,
+      position_size_eur NUMERIC NOT NULL,
+      leverage INTEGER NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      opened_at TIMESTAMPTZ NOT NULL,
+      exit_price NUMERIC,
+      close_reason TEXT,
+      pnl_eur NUMERIC,
+      closed_at TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS fvg_balance_history (
+      id SERIAL PRIMARY KEY, time TIMESTAMPTZ NOT NULL DEFAULT now(), balance NUMERIC NOT NULL
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS fvg_skipped_setups (
+      id UUID PRIMARY KEY, symbol TEXT NOT NULL, direction TEXT NOT NULL, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  const { rows } = await pgPool.query('SELECT id FROM fvg_settings WHERE id = 1');
+  if (!rows.length) {
+    await pgPool.query(
+      `INSERT INTO fvg_settings (id, enabled, start_capital_eur, num_slots, leverage, risk_reward_ratio, balance_eur, watched_symbols)
+       VALUES (1, false, $1, $2, $3, $4, $1, $5)`,
+      [FVG_DEFAULT_SETTINGS.startCapitalEur, FVG_DEFAULT_SETTINGS.numSlots, FVG_DEFAULT_SETTINGS.leverage, FVG_DEFAULT_SETTINGS.riskRewardRatio,
+       ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT']]
+    );
+    await pgPool.query('INSERT INTO fvg_balance_history (balance) VALUES ($1)', [FVG_DEFAULT_SETTINGS.startCapitalEur]);
+  }
+}
+
+function fvgRowToSettings(row) {
+  return {
+    enabled: row.enabled, startCapitalEur: Number(row.start_capital_eur), numSlots: Number(row.num_slots),
+    leverage: Number(row.leverage), riskRewardRatio: Number(row.risk_reward_ratio), balanceEur: Number(row.balance_eur),
+    watchedSymbols: row.watched_symbols, lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
+  };
+}
+async function getFvgSettings() {
+  const { rows } = await pgPool.query('SELECT * FROM fvg_settings WHERE id = 1');
+  return fvgRowToSettings(rows[0]);
+}
+function fvgRowToTrade(row) {
+  return {
+    id: row.id, symbol: row.symbol, direction: row.direction, entryPrice: Number(row.entry_price),
+    stopLoss: Number(row.stop_loss), takeProfit: Number(row.take_profit),
+    gapLow: Number(row.gap_low), gapHigh: Number(row.gap_high),
+    marginEur: Number(row.margin_eur), positionSizeEur: Number(row.position_size_eur), leverage: Number(row.leverage),
+    reason: row.reason, openedAt: new Date(row.opened_at).getTime(),
+    exitPrice: row.exit_price != null ? Number(row.exit_price) : null, closeReason: row.close_reason,
+    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null, closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null
+  };
+}
+
+const fvgLastPrices = {};
+
+// Findet alle 3-Kerzen-FVG-Zonen in der Historie (ohne die letzte Kerze,
+// die als potenzielle Revisit-Kerze separat geprüft wird).
+function findFvgZones(candles) {
+  const zones = [];
+  for (let i = 2; i < candles.length; i++) {
+    const k1 = candles[i - 2], k3 = candles[i];
+    if (k1.high < k3.low) {
+      zones.push({ type: 'bullish', gapLow: k1.high, gapHigh: k3.low, formedAtIndex: i });
+    } else if (k1.low > k3.high) {
+      zones.push({ type: 'bearish', gapLow: k3.high, gapHigh: k1.low, formedAtIndex: i });
+    }
+  }
+  return zones;
+}
+
+// Vereinfachte Heuristik. Feuert nur beim ERSTEN Berühren der Zone (die
+// vorherige Kerze durfte die Zone noch nicht berührt haben), damit nicht
+// jeden Zyklus erneut derselbe Revisit ausgelöst wird.
+function detectFvgSetup(candles) {
+  const n = candles.length;
+  if (n < 25) return null;
+  const zones = findFvgZones(candles.slice(0, n - 1));
+  const last = candles[n - 1];
+  const prev = candles[n - 2];
+
+  for (const zone of zones) {
+    const age = (n - 1) - zone.formedAtIndex;
+    if (age > 20 || age < 1) continue;
+    const touchesNow = last.low <= zone.gapHigh && last.high >= zone.gapLow;
+    const touchedBefore = prev.low <= zone.gapHigh && prev.high >= zone.gapLow;
+    if (touchesNow && !touchedBefore) {
+      return {
+        direction: zone.type === 'bullish' ? 'long' : 'short',
+        gapLow: zone.gapLow, gapHigh: zone.gapHigh, entryPrice: last.close
+      };
+    }
+  }
+  return null;
+}
+
+function computeFvgSlTp(direction, entryPrice, gapLow, gapHigh, riskReward) {
+  const bufferPct = 0.001, minDistPct = 0.0015;
+  let stopLoss = direction === 'long' ? gapLow * (1 - bufferPct) : gapHigh * (1 + bufferPct);
+  const distPct = Math.abs(entryPrice - stopLoss) / entryPrice;
+  if (distPct < minDistPct) stopLoss = direction === 'long' ? entryPrice * (1 - minDistPct) : entryPrice * (1 + minDistPct);
+  const distance = Math.abs(entryPrice - stopLoss);
+  const takeProfit = direction === 'long' ? entryPrice + distance * riskReward : entryPrice - distance * riskReward;
+  return { stopLoss, takeProfit };
+}
+
+async function checkFvgSymbol(symbol, settings) {
+  const candles = await fetchPaperCandles(symbol, '5m', 200);
+  const lastPrice = candles[candles.length - 1].close;
+  fvgLastPrices[symbol] = lastPrice;
+
+  const { rows: openRows } = await pgPool.query("SELECT * FROM fvg_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  for (const row of openRows) {
+    const trade = fvgRowToTrade(row);
+    let closeReason = null;
+    if (trade.direction === 'long') {
+      if (lastPrice >= trade.takeProfit) closeReason = 'TP'; else if (lastPrice <= trade.stopLoss) closeReason = 'SL';
+    } else {
+      if (lastPrice <= trade.takeProfit) closeReason = 'TP'; else if (lastPrice >= trade.stopLoss) closeReason = 'SL';
+    }
+    if (!closeReason) continue;
+    const exitPrice = lastPrice;
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    await pgPool.query(`UPDATE fvg_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`, [exitPrice, closeReason, pnlEur, trade.id]);
+    const { rows: balRows } = await pgPool.query('UPDATE fvg_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur', [pnlEur]);
+    await pgPool.query('INSERT INTO fvg_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+  }
+
+  const { rows: stillOpen } = await pgPool.query("SELECT COUNT(*)::int AS c FROM fvg_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  if (stillOpen[0].c > 0) return;
+
+  const setup = detectFvgSetup(candles);
+  if (!setup) return;
+
+  const plan = computeFvgSlTp(setup.direction, setup.entryPrice, setup.gapLow, setup.gapHigh, settings.riskRewardRatio);
+  const marginEur = settings.startCapitalEur / settings.numSlots;
+  const { rows: usedRows } = await pgPool.query("SELECT COALESCE(SUM(margin_eur), 0) AS used FROM fvg_trades WHERE status = 'open'");
+  const usedMarginEur = Number(usedRows[0].used);
+
+  const reasonText = `${setup.direction === 'long' ? 'Bullisches' : 'Bearisches'} FVG (${setup.gapLow.toFixed(4)} - ${setup.gapHigh.toFixed(4)}), Revisit bei ${setup.entryPrice.toFixed(4)}.`;
+
+  if (usedMarginEur + marginEur > settings.balanceEur) {
+    await pgPool.query('INSERT INTO fvg_skipped_setups (id, symbol, direction, reason) VALUES ($1, $2, $3, $4)',
+      [crypto.randomUUID(), symbol, setup.direction, `Kein freier Slot verfügbar (Margin ${marginEur.toFixed(2)}€ würde die Balance überschreiten). ${reasonText}`]);
+    return;
+  }
+
+  const positionSizeEur = marginEur * settings.leverage;
+  await pgPool.query(
+    `INSERT INTO fvg_trades (id, symbol, direction, entry_price, stop_loss, take_profit, gap_low, gap_high, margin_eur, position_size_eur, leverage, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, plan.stopLoss, plan.takeProfit, setup.gapLow, setup.gapHigh, marginEur, positionSizeEur, settings.leverage, reasonText]
+  );
+}
+
+async function runFvgTradingCycle() {
+  if (!pgPool) return;
+  const settings = await getFvgSettings();
+  if (!settings.enabled) return;
+  for (const symbol of settings.watchedSymbols) {
+    try { await checkFvgSymbol(symbol, settings); } catch (err) { console.error(`FVG-Bot-Fehler bei ${symbol}:`, err.message || err); }
+    await sleep(150);
+  }
+  await pgPool.query('UPDATE fvg_settings SET last_check = now() WHERE id = 1');
+}
+
+const FVG_CHECK_INTERVAL_MS = 150 * 1000; // 2,5 Minuten (Vorgabe: 2-3 Min)
+setInterval(runFvgTradingCycle, FVG_CHECK_INTERVAL_MS);
+
+app.get('/api/fvg-trading/state', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - FVG Bot nicht verfügbar.' });
+  try {
+    const settings = await getFvgSettings();
+    const { rows: openRows } = await pgPool.query("SELECT * FROM fvg_trades WHERE status = 'open' ORDER BY opened_at DESC");
+    const { rows: closedRows } = await pgPool.query("SELECT * FROM fvg_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
+    const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM fvg_balance_history ORDER BY time ASC');
+    const { rows: skippedRows } = await pgPool.query('SELECT * FROM fvg_skipped_setups ORDER BY created_at DESC LIMIT 50');
+
+    const openTrades = openRows.map(fvgRowToTrade).map(t => {
+      const currentPrice = fvgLastPrices[t.symbol] ?? null;
+      let unrealizedPnlEur = null;
+      if (currentPrice != null) {
+        unrealizedPnlEur = t.direction === 'long'
+          ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
+          : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
+      }
+      return { ...t, currentPrice, unrealizedPnlEur };
+    });
+    const closedTrades = closedRows.map(fvgRowToTrade);
+    const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
+    const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
+
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: FVG_CHECK_INTERVAL_MS });
+  } catch (err) {
+    console.error('FVG Bot: state-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/fvg-trading/settings', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - FVG Bot nicht verfügbar.' });
+  try {
+    const incoming = req.body || {};
+    const current = await getFvgSettings();
+    const wasEnabled = current.enabled;
+    const next = {
+      enabled: !!incoming.enabled,
+      startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
+      numSlots: Number(incoming.numSlots) >= 1 ? Math.round(Number(incoming.numSlots)) : current.numSlots,
+      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
+      riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : current.riskRewardRatio,
+      watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
+    };
+    await pgPool.query(
+      `UPDATE fvg_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, risk_reward_ratio = $5, watched_symbols = $6 WHERE id = 1`,
+      [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.riskRewardRatio, next.watchedSymbols]
+    );
+    if (next.enabled && !wasEnabled) runFvgTradingCycle();
+    res.json({ ok: true, settings: next });
+  } catch (err) {
+    console.error('FVG Bot: settings-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/fvg-trading/reset', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - FVG Bot nicht verfügbar.' });
+  try {
+    const settings = await getFvgSettings();
+    await pgPool.query('DELETE FROM fvg_trades');
+    await pgPool.query('DELETE FROM fvg_balance_history');
+    await pgPool.query('DELETE FROM fvg_skipped_setups');
+    await pgPool.query('UPDATE fvg_settings SET balance_eur = $1, last_check = NULL WHERE id = 1', [settings.startCapitalEur]);
+    await pgPool.query('INSERT INTO fvg_balance_history (balance) VALUES ($1)', [settings.startCapitalEur]);
+    Object.keys(fvgLastPrices).forEach(k => delete fvgLastPrices[k]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('FVG Bot: reset-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/fvg-trading/close/:id', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - FVG Bot nicht verfügbar.' });
+  try {
+    const { rows } = await pgPool.query("SELECT * FROM fvg_trades WHERE id = $1 AND status = 'open'", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Offener Trade nicht gefunden.' });
+    const trade = fvgRowToTrade(rows[0]);
+
+    let exitPrice, usedLastKnownPrice = false;
+    try {
+      exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol);
+    } catch (err) {
+      const cached = fvgLastPrices[trade.symbol];
+      if (cached == null) return res.status(503).json({ error: `Aktueller Kurs für ${trade.symbol} nicht abrufbar (${err.message}) und kein zwischengespeicherter Preis vorhanden. Bitte später erneut versuchen.` });
+      exitPrice = cached;
+      usedLastKnownPrice = true;
+    }
+
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+
+    await pgPool.query(`UPDATE fvg_trades SET status = 'closed', exit_price = $1, close_reason = 'MANUAL', pnl_eur = $2, closed_at = now() WHERE id = $3`, [exitPrice, pnlEur, trade.id]);
+    const { rows: balRows } = await pgPool.query('UPDATE fvg_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur', [pnlEur]);
+    await pgPool.query('INSERT INTO fvg_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+
+    res.json({ ok: true, exitPrice, pnlEur, usedLastKnownPrice });
+  } catch (err) {
+    console.error('FVG Bot: manuelles Schließen fehlgeschlagen:', err);
+    res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
+  }
+});
+
+// ============================================================
+// CANDLESTICK BOT - fünfter, komplett unabhängiger Paper-Trading-Bot
+// (eigene Strategie, eigener Kapitalschutz, eigene DB-Tabellen "candle_*").
+//
+// SICHERHEIT: Wie bei den anderen Bots - liest ausschließlich öffentliche
+// Binance-Kursdaten, verändert nur lokal simulierte Werte. NUR SIMULATION.
+//
+// STRATEGIE "Kerzenmuster" auf 5-Minuten-Basis:
+// Bullish Engulfing / Hammer nach vorherigem Abwärtskontext -> Long.
+// Bearish Engulfing / Shooting Star nach vorherigem Aufwärtskontext -> Short.
+// SL knapp hinter dem Extrempunkt der Signalkerze, Mindestabstand 0,15%.
+// TP = konfigurierbares RR-Verhältnis (Standard 1:3).
+// ============================================================
+const CANDLE_DEFAULT_SETTINGS = { enabled: false, startCapitalEur: 100, numSlots: 5, leverage: 5, riskRewardRatio: 3 };
+
+async function initCandleTradingSchema() {
+  if (!pgPool) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS candle_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      start_capital_eur NUMERIC NOT NULL DEFAULT 100,
+      num_slots INTEGER NOT NULL DEFAULT 5,
+      leverage INTEGER NOT NULL DEFAULT 5,
+      risk_reward_ratio NUMERIC NOT NULL DEFAULT 3,
+      balance_eur NUMERIC NOT NULL DEFAULT 100,
+      watched_symbols TEXT[] NOT NULL DEFAULT ARRAY['BTCUSDT','ETHUSDT','SOLUSDT'],
+      last_check TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS candle_trades (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      entry_price NUMERIC NOT NULL,
+      stop_loss NUMERIC NOT NULL,
+      take_profit NUMERIC NOT NULL,
+      pattern TEXT NOT NULL,
+      signal_extreme NUMERIC NOT NULL,
+      margin_eur NUMERIC NOT NULL,
+      position_size_eur NUMERIC NOT NULL,
+      leverage INTEGER NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      opened_at TIMESTAMPTZ NOT NULL,
+      exit_price NUMERIC,
+      close_reason TEXT,
+      pnl_eur NUMERIC,
+      closed_at TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS candle_balance_history (
+      id SERIAL PRIMARY KEY, time TIMESTAMPTZ NOT NULL DEFAULT now(), balance NUMERIC NOT NULL
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS candle_skipped_setups (
+      id UUID PRIMARY KEY, symbol TEXT NOT NULL, direction TEXT NOT NULL, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  const { rows } = await pgPool.query('SELECT id FROM candle_settings WHERE id = 1');
+  if (!rows.length) {
+    await pgPool.query(
+      `INSERT INTO candle_settings (id, enabled, start_capital_eur, num_slots, leverage, risk_reward_ratio, balance_eur, watched_symbols)
+       VALUES (1, false, $1, $2, $3, $4, $1, $5)`,
+      [CANDLE_DEFAULT_SETTINGS.startCapitalEur, CANDLE_DEFAULT_SETTINGS.numSlots, CANDLE_DEFAULT_SETTINGS.leverage, CANDLE_DEFAULT_SETTINGS.riskRewardRatio,
+       ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT']]
+    );
+    await pgPool.query('INSERT INTO candle_balance_history (balance) VALUES ($1)', [CANDLE_DEFAULT_SETTINGS.startCapitalEur]);
+  }
+}
+
+function candleRowToSettings(row) {
+  return {
+    enabled: row.enabled, startCapitalEur: Number(row.start_capital_eur), numSlots: Number(row.num_slots),
+    leverage: Number(row.leverage), riskRewardRatio: Number(row.risk_reward_ratio), balanceEur: Number(row.balance_eur),
+    watchedSymbols: row.watched_symbols, lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
+  };
+}
+async function getCandleSettings() {
+  const { rows } = await pgPool.query('SELECT * FROM candle_settings WHERE id = 1');
+  return candleRowToSettings(rows[0]);
+}
+function candleRowToTrade(row) {
+  return {
+    id: row.id, symbol: row.symbol, direction: row.direction, entryPrice: Number(row.entry_price),
+    stopLoss: Number(row.stop_loss), takeProfit: Number(row.take_profit),
+    pattern: row.pattern, signalExtreme: Number(row.signal_extreme),
+    marginEur: Number(row.margin_eur), positionSizeEur: Number(row.position_size_eur), leverage: Number(row.leverage),
+    reason: row.reason, openedAt: new Date(row.opened_at).getTime(),
+    exitPrice: row.exit_price != null ? Number(row.exit_price) : null, closeReason: row.close_reason,
+    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null, closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null
+  };
+}
+
+const candleLastPrices = {};
+
+function isBullishEngulfing(k1, k2) {
+  return k1.close < k1.open && k2.close > k2.open && k2.close > k1.open && k2.open < k1.close;
+}
+function isBearishEngulfing(k1, k2) {
+  return k1.close > k1.open && k2.close < k2.open && k2.close < k1.open && k2.open > k1.close;
+}
+function isHammer(c) {
+  const body = Math.abs(c.close - c.open);
+  const lowerWick = Math.min(c.open, c.close) - c.low;
+  const upperWick = c.high - Math.max(c.open, c.close);
+  return body > 0 && lowerWick >= body * 2 && upperWick <= body * 0.5;
+}
+function isShootingStar(c) {
+  const body = Math.abs(c.close - c.open);
+  const upperWick = c.high - Math.max(c.open, c.close);
+  const lowerWick = Math.min(c.open, c.close) - c.low;
+  return body > 0 && upperWick >= body * 2 && lowerWick <= body * 0.5;
+}
+
+// Zusatzbedingung: mind. 2 rote Kerzen direkt davor ODER fallender SMA10
+// (Abwärtskontext für Long-Signale; gespiegelt für Short).
+function priorTrendDown(candles, idx) {
+  if (idx < 3) return false;
+  const redRun = candles[idx - 1].close < candles[idx - 1].open && candles[idx - 2].close < candles[idx - 2].open;
+  if (redRun) return true;
+  if (idx < 11) return false;
+  const sma = start => candles.slice(start, start + 10).reduce((s, c) => s + c.close, 0) / 10;
+  return sma(idx - 10) < sma(idx - 11);
+}
+function priorTrendUp(candles, idx) {
+  if (idx < 3) return false;
+  const greenRun = candles[idx - 1].close > candles[idx - 1].open && candles[idx - 2].close > candles[idx - 2].open;
+  if (greenRun) return true;
+  if (idx < 11) return false;
+  const sma = start => candles.slice(start, start + 10).reduce((s, c) => s + c.close, 0) / 10;
+  return sma(idx - 10) > sma(idx - 11);
+}
+
+// Vereinfachte Heuristik, keine Garantie für korrekte Mustererkennung.
+function detectCandleSetup(candles) {
+  const n = candles.length;
+  if (n < 15) return null;
+  const k2 = candles[n - 1], k1 = candles[n - 2];
+
+  if (priorTrendDown(candles, n - 1) && isBullishEngulfing(k1, k2)) {
+    return { direction: 'long', pattern: 'Bullish Engulfing', signalExtreme: k2.low, entryPrice: k2.close };
+  }
+  if (priorTrendDown(candles, n - 1) && isHammer(k2)) {
+    return { direction: 'long', pattern: 'Hammer', signalExtreme: k2.low, entryPrice: k2.close };
+  }
+  if (priorTrendUp(candles, n - 1) && isBearishEngulfing(k1, k2)) {
+    return { direction: 'short', pattern: 'Bearish Engulfing', signalExtreme: k2.high, entryPrice: k2.close };
+  }
+  if (priorTrendUp(candles, n - 1) && isShootingStar(k2)) {
+    return { direction: 'short', pattern: 'Shooting Star', signalExtreme: k2.high, entryPrice: k2.close };
+  }
+  return null;
+}
+
+function computeCandleSlTp(direction, entryPrice, signalExtreme, riskReward) {
+  const bufferPct = 0.001, minDistPct = 0.0015;
+  let stopLoss = direction === 'long' ? signalExtreme * (1 - bufferPct) : signalExtreme * (1 + bufferPct);
+  const distPct = Math.abs(entryPrice - stopLoss) / entryPrice;
+  if (distPct < minDistPct) stopLoss = direction === 'long' ? entryPrice * (1 - minDistPct) : entryPrice * (1 + minDistPct);
+  const distance = Math.abs(entryPrice - stopLoss);
+  const takeProfit = direction === 'long' ? entryPrice + distance * riskReward : entryPrice - distance * riskReward;
+  return { stopLoss, takeProfit };
+}
+
+async function checkCandleSymbol(symbol, settings) {
+  const candles = await fetchPaperCandles(symbol, '5m', 200);
+  const lastPrice = candles[candles.length - 1].close;
+  candleLastPrices[symbol] = lastPrice;
+
+  const { rows: openRows } = await pgPool.query("SELECT * FROM candle_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  for (const row of openRows) {
+    const trade = candleRowToTrade(row);
+    let closeReason = null;
+    if (trade.direction === 'long') {
+      if (lastPrice >= trade.takeProfit) closeReason = 'TP'; else if (lastPrice <= trade.stopLoss) closeReason = 'SL';
+    } else {
+      if (lastPrice <= trade.takeProfit) closeReason = 'TP'; else if (lastPrice >= trade.stopLoss) closeReason = 'SL';
+    }
+    if (!closeReason) continue;
+    const exitPrice = lastPrice;
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    await pgPool.query(`UPDATE candle_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`, [exitPrice, closeReason, pnlEur, trade.id]);
+    const { rows: balRows } = await pgPool.query('UPDATE candle_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur', [pnlEur]);
+    await pgPool.query('INSERT INTO candle_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+  }
+
+  const { rows: stillOpen } = await pgPool.query("SELECT COUNT(*)::int AS c FROM candle_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  if (stillOpen[0].c > 0) return;
+
+  const setup = detectCandleSetup(candles);
+  if (!setup) return;
+
+  const plan = computeCandleSlTp(setup.direction, setup.entryPrice, setup.signalExtreme, settings.riskRewardRatio);
+  const marginEur = settings.startCapitalEur / settings.numSlots;
+  const { rows: usedRows } = await pgPool.query("SELECT COALESCE(SUM(margin_eur), 0) AS used FROM candle_trades WHERE status = 'open'");
+  const usedMarginEur = Number(usedRows[0].used);
+
+  const reasonText = `${setup.pattern} erkannt (Signalkerze Extrempunkt ${setup.signalExtreme.toFixed(4)}), Einstieg bei ${setup.entryPrice.toFixed(4)}.`;
+
+  if (usedMarginEur + marginEur > settings.balanceEur) {
+    await pgPool.query('INSERT INTO candle_skipped_setups (id, symbol, direction, reason) VALUES ($1, $2, $3, $4)',
+      [crypto.randomUUID(), symbol, setup.direction, `Kein freier Slot verfügbar (Margin ${marginEur.toFixed(2)}€ würde die Balance überschreiten). ${reasonText}`]);
+    return;
+  }
+
+  const positionSizeEur = marginEur * settings.leverage;
+  await pgPool.query(
+    `INSERT INTO candle_trades (id, symbol, direction, entry_price, stop_loss, take_profit, pattern, signal_extreme, margin_eur, position_size_eur, leverage, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, plan.stopLoss, plan.takeProfit, setup.pattern, setup.signalExtreme, marginEur, positionSizeEur, settings.leverage, reasonText]
+  );
+}
+
+async function runCandleTradingCycle() {
+  if (!pgPool) return;
+  const settings = await getCandleSettings();
+  if (!settings.enabled) return;
+  for (const symbol of settings.watchedSymbols) {
+    try { await checkCandleSymbol(symbol, settings); } catch (err) { console.error(`Candlestick-Bot-Fehler bei ${symbol}:`, err.message || err); }
+    await sleep(150);
+  }
+  await pgPool.query('UPDATE candle_settings SET last_check = now() WHERE id = 1');
+}
+
+const CANDLE_CHECK_INTERVAL_MS = 150 * 1000; // 2,5 Minuten (Vorgabe: 2-3 Min)
+setInterval(runCandleTradingCycle, CANDLE_CHECK_INTERVAL_MS);
+
+app.get('/api/candle-trading/state', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Candlestick Bot nicht verfügbar.' });
+  try {
+    const settings = await getCandleSettings();
+    const { rows: openRows } = await pgPool.query("SELECT * FROM candle_trades WHERE status = 'open' ORDER BY opened_at DESC");
+    const { rows: closedRows } = await pgPool.query("SELECT * FROM candle_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
+    const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM candle_balance_history ORDER BY time ASC');
+    const { rows: skippedRows } = await pgPool.query('SELECT * FROM candle_skipped_setups ORDER BY created_at DESC LIMIT 50');
+
+    const openTrades = openRows.map(candleRowToTrade).map(t => {
+      const currentPrice = candleLastPrices[t.symbol] ?? null;
+      let unrealizedPnlEur = null;
+      if (currentPrice != null) {
+        unrealizedPnlEur = t.direction === 'long'
+          ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
+          : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
+      }
+      return { ...t, currentPrice, unrealizedPnlEur };
+    });
+    const closedTrades = closedRows.map(candleRowToTrade);
+    const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
+    const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
+
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: CANDLE_CHECK_INTERVAL_MS });
+  } catch (err) {
+    console.error('Candlestick Bot: state-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/candle-trading/settings', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Candlestick Bot nicht verfügbar.' });
+  try {
+    const incoming = req.body || {};
+    const current = await getCandleSettings();
+    const wasEnabled = current.enabled;
+    const next = {
+      enabled: !!incoming.enabled,
+      startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
+      numSlots: Number(incoming.numSlots) >= 1 ? Math.round(Number(incoming.numSlots)) : current.numSlots,
+      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
+      riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : current.riskRewardRatio,
+      watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
+    };
+    await pgPool.query(
+      `UPDATE candle_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, risk_reward_ratio = $5, watched_symbols = $6 WHERE id = 1`,
+      [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.riskRewardRatio, next.watchedSymbols]
+    );
+    if (next.enabled && !wasEnabled) runCandleTradingCycle();
+    res.json({ ok: true, settings: next });
+  } catch (err) {
+    console.error('Candlestick Bot: settings-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/candle-trading/reset', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Candlestick Bot nicht verfügbar.' });
+  try {
+    const settings = await getCandleSettings();
+    await pgPool.query('DELETE FROM candle_trades');
+    await pgPool.query('DELETE FROM candle_balance_history');
+    await pgPool.query('DELETE FROM candle_skipped_setups');
+    await pgPool.query('UPDATE candle_settings SET balance_eur = $1, last_check = NULL WHERE id = 1', [settings.startCapitalEur]);
+    await pgPool.query('INSERT INTO candle_balance_history (balance) VALUES ($1)', [settings.startCapitalEur]);
+    Object.keys(candleLastPrices).forEach(k => delete candleLastPrices[k]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Candlestick Bot: reset-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/candle-trading/close/:id', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - Candlestick Bot nicht verfügbar.' });
+  try {
+    const { rows } = await pgPool.query("SELECT * FROM candle_trades WHERE id = $1 AND status = 'open'", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Offener Trade nicht gefunden.' });
+    const trade = candleRowToTrade(rows[0]);
+
+    let exitPrice, usedLastKnownPrice = false;
+    try {
+      exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol);
+    } catch (err) {
+      const cached = candleLastPrices[trade.symbol];
+      if (cached == null) return res.status(503).json({ error: `Aktueller Kurs für ${trade.symbol} nicht abrufbar (${err.message}) und kein zwischengespeicherter Preis vorhanden. Bitte später erneut versuchen.` });
+      exitPrice = cached;
+      usedLastKnownPrice = true;
+    }
+
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+
+    await pgPool.query(`UPDATE candle_trades SET status = 'closed', exit_price = $1, close_reason = 'MANUAL', pnl_eur = $2, closed_at = now() WHERE id = $3`, [exitPrice, pnlEur, trade.id]);
+    const { rows: balRows } = await pgPool.query('UPDATE candle_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur', [pnlEur]);
+    await pgPool.query('INSERT INTO candle_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+
+    res.json({ ok: true, exitPrice, pnlEur, usedLastKnownPrice });
+  } catch (err) {
+    console.error('Candlestick Bot: manuelles Schließen fehlgeschlagen:', err);
+    res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
+  }
+});
+
 const PORT = process.env.PORT || 5055;
 
 initPaperTradingSchema()
@@ -1946,6 +2607,18 @@ initScalpTradingSchema()
     if (pgPool) console.log('Scalping Bot: Datenbank-Schema bereit.');
   })
   .catch(err => console.error('Scalping Bot: Schema-Initialisierung fehlgeschlagen:', err));
+
+initFvgTradingSchema()
+  .then(() => {
+    if (pgPool) console.log('FVG Bot: Datenbank-Schema bereit.');
+  })
+  .catch(err => console.error('FVG Bot: Schema-Initialisierung fehlgeschlagen:', err));
+
+initCandleTradingSchema()
+  .then(() => {
+    if (pgPool) console.log('Candlestick Bot: Datenbank-Schema bereit.');
+  })
+  .catch(err => console.error('Candlestick Bot: Schema-Initialisierung fehlgeschlagen:', err));
 
 app.listen(PORT, () => {
   console.log(`Jarvis-Server läuft auf http://localhost:${PORT}`);
