@@ -3893,6 +3893,12 @@
               <label>Anzahl fester Slots<input type="number" step="1" min="1" max="20" class="select-input" id="scalpSlots"></label>
               <label>Hebel (1x - 10x)<input type="number" step="1" min="1" max="10" class="select-input" id="scalpLeverage"></label>
             </div>
+            <div class="panel-title" style="margin-top:14px;">ZUSATZFILTER <span class="card-title-hint">— einzeln an-/abschaltbar</span></div>
+            <div class="at-criteria-toggles">
+              <label class="at-criteria-toggle"><input type="checkbox" id="scalpCritTrend"> Trendfilter (EMA200, 1h)</label>
+              <label class="at-criteria-toggle"><input type="checkbox" id="scalpCritVolume"> Volumen-Bestätigung (≥1,3x Ø)</label>
+              <label class="at-criteria-toggle"><input type="checkbox" id="scalpCritVolatility"> Marktphasenfilter (Volatilität)</label>
+            </div>
             <div class="panel-title" style="margin-top:14px;">BEOBACHTETE COINS</div>
             <div class="at-coin-select" id="scalpCoinSelect"></div>
             <div class="quick-action-row" style="margin-top:14px;">
@@ -3933,6 +3939,11 @@
           <div class="panel-card">
             <div class="panel-title">ÜBERSPRUNGENE SETUPS <span class="card-title-hint">— erkannt, aber kein freier Slot</span></div>
             <div class="trade-list" id="scalpSkippedList"><div class="notes-empty">Noch keine übersprungenen Setups.</div></div>
+          </div>
+
+          <div class="panel-card">
+            <div class="panel-title">LETZTE PRÜFUNGEN <span class="card-title-hint">— was der Bot pro Coin gerade sieht</span></div>
+            <div class="at-check-log" id="scalpCheckLog"><div class="notes-empty">Noch keine Prüfungen protokolliert.</div></div>
           </div>
 
         </div>
@@ -7531,6 +7542,22 @@
     </div>`;
   }
 
+  function scalpCheckRowHtml(c) {
+    const time = new Date(c.checkedAt).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+    let statusClass = 'none', statusLabel = 'KEIN SIGNAL';
+    if (c.signalFound && c.failedCriteria) { statusClass = 'blocked'; statusLabel = 'BLOCKIERT'; }
+    else if (c.signalFound && !c.failedCriteria) { statusClass = 'passed'; statusLabel = 'DURCHGELASSEN'; }
+    const dirText = c.direction ? ` (${c.direction === 'long' ? 'LONG' : 'SHORT'})` : '';
+    return `<div class="at-check-row">
+      <div class="at-check-row-top">
+        <span class="at-check-sym">${escapeHtml(c.symbol.replace('USDT', '/USDT'))}${dirText}</span>
+        <span class="at-check-status ${statusClass}">${statusLabel}</span>
+      </div>
+      <div class="at-check-note">${escapeHtml(c.note || '')}</div>
+      <div class="at-check-time">${time}</div>
+    </div>`;
+  }
+
   function atTradeRowHtml(t, isOpen) {
     const dirClass = t.direction === 'long' ? 'long' : 'short';
     const dirLabel = t.direction === 'long' ? 'LONG' : 'SHORT';
@@ -8384,6 +8411,9 @@
       document.getElementById('scalpStartCapital').value = data.settings.startCapitalEur;
       document.getElementById('scalpSlots').value = data.settings.numSlots;
       document.getElementById('scalpLeverage').value = data.settings.leverage;
+      document.getElementById('scalpCritTrend').checked = !!data.settings.criteriaTrendEnabled;
+      document.getElementById('scalpCritVolume').checked = !!data.settings.criteriaVolumeEnabled;
+      document.getElementById('scalpCritVolatility').checked = !!data.settings.criteriaVolatilityEnabled;
 
       const toggleBtn = document.getElementById('scalpEnableToggle');
       toggleBtn.classList.toggle('on', data.settings.enabled);
@@ -8446,6 +8476,14 @@
           : 'Noch keine Prüfung durchgeführt.';
       }
 
+      const checkLogEl = document.getElementById('scalpCheckLog');
+      if (checkLogEl) {
+        const log = data.checkLog || [];
+        checkLogEl.innerHTML = log.length
+          ? log.map(scalpCheckRowHtml).join('')
+          : '<div class="notes-empty">Noch keine Prüfungen protokolliert.</div>';
+      }
+
       scalpLastLoadTime = Date.now();
       scalpNextCheckAt = data.lastCheck && data.checkIntervalMs ? data.lastCheck + data.checkIntervalMs : null;
       updateScalpUpdateInfo();
@@ -8462,6 +8500,9 @@
       startCapitalEur: parseFloat(document.getElementById('scalpStartCapital').value),
       numSlots: parseInt(document.getElementById('scalpSlots').value, 10),
       leverage: parseInt(document.getElementById('scalpLeverage').value, 10),
+      criteriaTrendEnabled: document.getElementById('scalpCritTrend').checked,
+      criteriaVolumeEnabled: document.getElementById('scalpCritVolume').checked,
+      criteriaVolatilityEnabled: document.getElementById('scalpCritVolatility').checked,
       watchedSymbols: scalpSelectedSymbols
     };
     const res = await fetch('/api/scalp-trading/settings', {

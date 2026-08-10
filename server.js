@@ -1497,7 +1497,10 @@ const SCALP_DEFAULT_SETTINGS = {
   enabled: false,
   startCapitalEur: 100,
   numSlots: 5,
-  leverage: 5
+  leverage: 5,
+  criteriaTrendEnabled: true,
+  criteriaVolumeEnabled: false,
+  criteriaVolatilityEnabled: false
 };
 
 async function initScalpTradingSchema() {
@@ -1552,14 +1555,35 @@ async function initScalpTradingSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS scalp_check_log (
+      symbol TEXT PRIMARY KEY,
+      signal_found BOOLEAN NOT NULL DEFAULT false,
+      direction TEXT,
+      failed_criteria TEXT,
+      note TEXT,
+      checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+
+  // Migration für die neuen Zusatzfilter-Spalten (nachträglich hinzugekommen -
+  // CREATE TABLE IF NOT EXISTS ergänzt bei bereits existierenden Tabellen
+  // keine neuen Spalten, daher hier explizit per ALTER nachziehen).
+  await pgPool.query('ALTER TABLE scalp_settings ADD COLUMN IF NOT EXISTS criteria_trend_enabled BOOLEAN NOT NULL DEFAULT true');
+  await pgPool.query('ALTER TABLE scalp_settings ADD COLUMN IF NOT EXISTS criteria_volume_enabled BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE scalp_settings ADD COLUMN IF NOT EXISTS criteria_volatility_enabled BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS criteria_trend BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS criteria_volume BOOLEAN NOT NULL DEFAULT false');
+  await pgPool.query('ALTER TABLE scalp_trades ADD COLUMN IF NOT EXISTS criteria_volatility BOOLEAN NOT NULL DEFAULT false');
 
   const { rows } = await pgPool.query('SELECT id FROM scalp_settings WHERE id = 1');
   if (!rows.length) {
     await pgPool.query(
-      `INSERT INTO scalp_settings (id, enabled, start_capital_eur, num_slots, leverage, balance_eur, watched_symbols)
-       VALUES (1, false, $1, $2, $3, $1, $4)`,
+      `INSERT INTO scalp_settings (id, enabled, start_capital_eur, num_slots, leverage, balance_eur, watched_symbols, criteria_trend_enabled, criteria_volume_enabled, criteria_volatility_enabled)
+       VALUES (1, false, $1, $2, $3, $1, $4, $5, $6, $7)`,
       [SCALP_DEFAULT_SETTINGS.startCapitalEur, SCALP_DEFAULT_SETTINGS.numSlots, SCALP_DEFAULT_SETTINGS.leverage,
-       ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT']]
+       ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT'],
+       SCALP_DEFAULT_SETTINGS.criteriaTrendEnabled, SCALP_DEFAULT_SETTINGS.criteriaVolumeEnabled, SCALP_DEFAULT_SETTINGS.criteriaVolatilityEnabled]
     );
     await pgPool.query('INSERT INTO scalp_balance_history (balance) VALUES ($1)', [SCALP_DEFAULT_SETTINGS.startCapitalEur]);
   }
@@ -1573,6 +1597,9 @@ function scalpRowToSettings(row) {
     leverage: Number(row.leverage),
     balanceEur: Number(row.balance_eur),
     watchedSymbols: row.watched_symbols,
+    criteriaTrendEnabled: row.criteria_trend_enabled,
+    criteriaVolumeEnabled: row.criteria_volume_enabled,
+    criteriaVolatilityEnabled: row.criteria_volatility_enabled,
     lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
   };
 }
@@ -1595,6 +1622,9 @@ function scalpRowToTrade(row) {
     marginEur: Number(row.margin_eur),
     positionSizeEur: Number(row.position_size_eur),
     leverage: Number(row.leverage),
+    criteriaTrend: row.criteria_trend,
+    criteriaVolume: row.criteria_volume,
+    criteriaVolatility: row.criteria_volatility,
     reason: row.reason,
     openedAt: new Date(row.opened_at).getTime(),
     exitPrice: row.exit_price != null ? Number(row.exit_price) : null,
@@ -1723,6 +1753,51 @@ function computeScalpSlTp(direction, entryPrice, priorSar) {
   return { stopLoss, takeProfit };
 }
 
+// ---- Zusatzfilter für den Scalping Bot (einzeln über die Einstellungen
+// an-/abschaltbar, Standard: nur Trendfilter aktiv) ----
+
+function computeEma(values, period) {
+  if (values.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < values.length; i++) ema = values[i] * k + ema * (1 - k);
+  return ema;
+}
+
+// a) Trendfilter: EMA200 auf 1h. Long nur über der EMA, Short nur darunter.
+function checkScalpTrendFilter(candles1h, direction) {
+  const closes = candles1h.map(c => c.close);
+  const ema200 = computeEma(closes, Math.min(200, closes.length));
+  if (ema200 == null) return { pass: false, ema200: null };
+  const currentPrice = closes[closes.length - 1];
+  const pass = direction === 'long' ? currentPrice > ema200 : currentPrice < ema200;
+  return { pass, ema200 };
+}
+
+// b) Volumen-Bestätigung: Signalkerze (letzte Kerze) >= 1,3x Ø der letzten 20 Kerzen davor.
+function checkScalpVolumeConfirmation(candles) {
+  const n = candles.length;
+  const priorVolumes = candles.slice(Math.max(0, n - 21), n - 1).map(c => c.volume);
+  if (!priorVolumes.length) return { pass: false, avgVolume: 0 };
+  const avgVolume = priorVolumes.reduce((a, b) => a + b, 0) / priorVolumes.length;
+  const signalVolume = candles[n - 1].volume;
+  return { pass: avgVolume > 0 && signalVolume >= avgVolume * 1.3, avgVolume, signalVolume };
+}
+
+// c) Marktphasen-/Volatilitätsfilter: Ø-Kerzenspanne der letzten 20 Kerzen
+// muss mindestens 50% der Ø-Kerzenspanne der letzten 100 Kerzen betragen -
+// filtert sehr ruhige, richtungslose Phasen heraus.
+function checkScalpVolatilityFilter(candles) {
+  const n = candles.length;
+  const range = c => c.high - c.low;
+  const last20 = candles.slice(Math.max(0, n - 20), n);
+  const last100 = candles.slice(Math.max(0, n - 100), n);
+  if (!last20.length || !last100.length) return { pass: false };
+  const avg20 = last20.reduce((s, c) => s + range(c), 0) / last20.length;
+  const avg100 = last100.reduce((s, c) => s + range(c), 0) / last100.length;
+  return { pass: avg100 > 0 && avg20 >= avg100 * 0.5, avg20, avg100 };
+}
+
 async function checkScalpSymbol(symbol, settings) {
   const candles = await fetchPaperCandles(symbol, '5m', 200);
   const lastPrice = candles[candles.length - 1].close;
@@ -1762,8 +1837,39 @@ async function checkScalpSymbol(symbol, settings) {
   );
   if (stillOpenForSymbol[0].c > 0) return;
 
+  async function logScalpCheck({ signalFound, direction, failedCriteria, note }) {
+    await pgPool.query(
+      `INSERT INTO scalp_check_log (symbol, signal_found, direction, failed_criteria, note, checked_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (symbol) DO UPDATE SET signal_found = $2, direction = $3, failed_criteria = $4, note = $5, checked_at = now()`,
+      [symbol, signalFound, direction || null, failedCriteria || null, note || null]
+    );
+  }
+
   const setup = detectScalpSetup(candles);
-  if (!setup) return;
+  if (!setup) {
+    await logScalpCheck({ signalFound: false, direction: null, failedCriteria: null, note: 'Kein SAR+RSI-Signal in diesem Zeitraum.' });
+    return;
+  }
+
+  // Zusatzfilter: einzeln über die Einstellungen an-/abschaltbar. Ein
+  // deaktiviertes Kriterium blockiert nie, nur aktivierte müssen passen.
+  const candles1h = await fetchPaperCandles(symbol, '1h', 200);
+  const trend = checkScalpTrendFilter(candles1h, setup.direction);
+  const volume = checkScalpVolumeConfirmation(candles);
+  const volatility = checkScalpVolatilityFilter(candles);
+
+  const failed = [];
+  if (settings.criteriaTrendEnabled && !trend.pass) failed.push('Trendfilter');
+  if (settings.criteriaVolumeEnabled && !volume.pass) failed.push('Volumen-Bestätigung');
+  if (settings.criteriaVolatilityEnabled && !volatility.pass) failed.push('Marktphasenfilter');
+
+  if (failed.length) {
+    await logScalpCheck({ signalFound: true, direction: setup.direction, failedCriteria: failed.join(', '), note: `SAR+RSI-Signal gefunden, aber ${failed.join(', ')} nicht erfüllt.` });
+    return;
+  }
+
+  await logScalpCheck({ signalFound: true, direction: setup.direction, failedCriteria: null, note: 'SAR+RSI-Signal gefunden, alle aktivierten Zusatzfilter erfüllt - Trade eröffnet.' });
 
   const plan = computeScalpSlTp(setup.direction, setup.entryPrice, setup.priorSar);
 
@@ -1786,9 +1892,9 @@ async function checkScalpSymbol(symbol, settings) {
   const positionSizeEur = marginEur * settings.leverage;
 
   await pgPool.query(
-    `INSERT INTO scalp_trades (id, symbol, direction, entry_price, stop_loss, take_profit, prior_sar, rsi_at_entry, margin_eur, position_size_eur, leverage, reason, status, opened_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'open', now())`,
-    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, plan.stopLoss, plan.takeProfit, setup.priorSar, setup.rsi, marginEur, positionSizeEur, settings.leverage, reasonText]
+    `INSERT INTO scalp_trades (id, symbol, direction, entry_price, stop_loss, take_profit, prior_sar, rsi_at_entry, margin_eur, position_size_eur, leverage, criteria_trend, criteria_volume, criteria_volatility, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, plan.stopLoss, plan.takeProfit, setup.priorSar, setup.rsi, marginEur, positionSizeEur, settings.leverage, trend.pass, volume.pass, volatility.pass, reasonText]
   );
 }
 
@@ -1825,6 +1931,7 @@ app.get('/api/scalp-trading/state', async (req, res) => {
     const { rows: closedRows } = await pgPool.query("SELECT * FROM scalp_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM scalp_balance_history ORDER BY time ASC');
     const { rows: skippedRows } = await pgPool.query('SELECT * FROM scalp_skipped_setups ORDER BY created_at DESC LIMIT 50');
+    const { rows: checkLogRows } = await pgPool.query('SELECT * FROM scalp_check_log ORDER BY checked_at DESC');
 
     const openTrades = openRows.map(scalpRowToTrade).map(t => {
       const currentPrice = scalpLastPrices[t.symbol] ?? null;
@@ -1841,8 +1948,12 @@ app.get('/api/scalp-trading/state', async (req, res) => {
     const skippedSetups = skippedRows.map(r => ({
       id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime()
     }));
+    const checkLog = checkLogRows.map(r => ({
+      symbol: r.symbol, signalFound: r.signal_found, direction: r.direction,
+      failedCriteria: r.failed_criteria, note: r.note, checkedAt: new Date(r.checked_at).getTime()
+    }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: SCALP_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: SCALP_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('Scalping Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -1860,13 +1971,16 @@ app.post('/api/scalp-trading/settings', async (req, res) => {
       startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
       numSlots: Number(incoming.numSlots) >= 1 ? Math.round(Number(incoming.numSlots)) : current.numSlots,
       leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
-      watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
+      watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols,
+      criteriaTrendEnabled: incoming.criteriaTrendEnabled !== undefined ? !!incoming.criteriaTrendEnabled : current.criteriaTrendEnabled,
+      criteriaVolumeEnabled: incoming.criteriaVolumeEnabled !== undefined ? !!incoming.criteriaVolumeEnabled : current.criteriaVolumeEnabled,
+      criteriaVolatilityEnabled: incoming.criteriaVolatilityEnabled !== undefined ? !!incoming.criteriaVolatilityEnabled : current.criteriaVolatilityEnabled
     };
     const leverageWarning = await checkLeverageChangeWarning('scalp_trades', current.leverage, next.leverage);
 
     await pgPool.query(
-      `UPDATE scalp_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, watched_symbols = $5 WHERE id = 1`,
-      [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.watchedSymbols]
+      `UPDATE scalp_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, watched_symbols = $5, criteria_trend_enabled = $6, criteria_volume_enabled = $7, criteria_volatility_enabled = $8 WHERE id = 1`,
+      [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.watchedSymbols, next.criteriaTrendEnabled, next.criteriaVolumeEnabled, next.criteriaVolatilityEnabled]
     );
     if (next.enabled && !wasEnabled) runScalpTradingCycle();
     res.json({ ok: true, settings: next, leverageWarning });
@@ -1883,6 +1997,7 @@ app.post('/api/scalp-trading/reset', async (req, res) => {
     await pgPool.query('DELETE FROM scalp_trades');
     await pgPool.query('DELETE FROM scalp_balance_history');
     await pgPool.query('DELETE FROM scalp_skipped_setups');
+    await pgPool.query('DELETE FROM scalp_check_log');
     await pgPool.query('UPDATE scalp_settings SET balance_eur = $1, last_check = NULL WHERE id = 1', [settings.startCapitalEur]);
     await pgPool.query('INSERT INTO scalp_balance_history (balance) VALUES ($1)', [settings.startCapitalEur]);
     Object.keys(scalpLastPrices).forEach(k => delete scalpLastPrices[k]);
