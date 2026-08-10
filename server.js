@@ -914,13 +914,15 @@ app.post('/api/paper-trading/settings', async (req, res) => {
       criteriaVolumeEnabled: incoming.criteriaVolumeEnabled !== undefined ? !!incoming.criteriaVolumeEnabled : current.criteriaVolumeEnabled,
       criteriaMtfEnabled: incoming.criteriaMtfEnabled !== undefined ? !!incoming.criteriaMtfEnabled : current.criteriaMtfEnabled
     };
+    const leverageWarning = await checkLeverageChangeWarning('paper_trades', current.leverage, next.leverage);
+
     await pgPool.query(
       `UPDATE paper_settings SET enabled = $1, risk_per_trade_eur = $2, risk_reward_ratio = $3, watched_symbols = $4, start_capital_eur = $5, max_open_positions = $6, leverage = $7, criteria_trend_enabled = $8, criteria_volume_enabled = $9, criteria_mtf_enabled = $10 WHERE id = 1`,
       [next.enabled, next.riskPerTradeEur, next.riskRewardRatio, next.watchedSymbols, next.startCapitalEur, next.maxOpenPositions, next.leverage, next.criteriaTrendEnabled, next.criteriaVolumeEnabled, next.criteriaMtfEnabled]
     );
 
     if (next.enabled && !wasEnabled) runPaperTradingCycle();
-    res.json({ ok: true, settings: next });
+    res.json({ ok: true, settings: next, leverageWarning });
   } catch (err) {
     console.error('Paper-Trading: settings-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -1403,12 +1405,14 @@ app.post('/api/ny-trading/settings', async (req, res) => {
       leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
       watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
     };
+    const leverageWarning = await checkLeverageChangeWarning('ny_trades', current.leverage, next.leverage);
+
     await pgPool.query(
       `UPDATE ny_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, watched_symbols = $5 WHERE id = 1`,
       [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.watchedSymbols]
     );
     if (next.enabled && !wasEnabled) runNyTradingCycle();
-    res.json({ ok: true, settings: next });
+    res.json({ ok: true, settings: next, leverageWarning });
   } catch (err) {
     console.error('NY Range Bot: settings-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -1858,12 +1862,14 @@ app.post('/api/scalp-trading/settings', async (req, res) => {
       leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
       watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
     };
+    const leverageWarning = await checkLeverageChangeWarning('scalp_trades', current.leverage, next.leverage);
+
     await pgPool.query(
       `UPDATE scalp_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, watched_symbols = $5 WHERE id = 1`,
       [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.watchedSymbols]
     );
     if (next.enabled && !wasEnabled) runScalpTradingCycle();
-    res.json({ ok: true, settings: next });
+    res.json({ ok: true, settings: next, leverageWarning });
   } catch (err) {
     console.error('Scalping Bot: settings-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -2189,12 +2195,14 @@ app.post('/api/fvg-trading/settings', async (req, res) => {
       riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : current.riskRewardRatio,
       watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
     };
+    const leverageWarning = await checkLeverageChangeWarning('fvg_trades', current.leverage, next.leverage);
+
     await pgPool.query(
       `UPDATE fvg_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, risk_reward_ratio = $5, watched_symbols = $6 WHERE id = 1`,
       [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.riskRewardRatio, next.watchedSymbols]
     );
     if (next.enabled && !wasEnabled) runFvgTradingCycle();
-    res.json({ ok: true, settings: next });
+    res.json({ ok: true, settings: next, leverageWarning });
   } catch (err) {
     console.error('FVG Bot: settings-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -2527,12 +2535,14 @@ app.post('/api/candle-trading/settings', async (req, res) => {
       riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : current.riskRewardRatio,
       watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
     };
+    const leverageWarning = await checkLeverageChangeWarning('candle_trades', current.leverage, next.leverage);
+
     await pgPool.query(
       `UPDATE candle_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, risk_reward_ratio = $5, watched_symbols = $6 WHERE id = 1`,
       [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.riskRewardRatio, next.watchedSymbols]
     );
     if (next.enabled && !wasEnabled) runCandleTradingCycle();
-    res.json({ ok: true, settings: next });
+    res.json({ ok: true, settings: next, leverageWarning });
   } catch (err) {
     console.error('Candlestick Bot: settings-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -2588,6 +2598,377 @@ app.post('/api/candle-trading/close/:id', async (req, res) => {
   }
 });
 
+// Gemeinsamer Hebel-Konsistenz-Check für ALLE Bots: warnt (blockiert
+// nichts), wenn der Hebel geändert wird während bereits Trades existieren -
+// das würde sonst zu Trades mit unterschiedlichem Hebel in derselben
+// Auswertung führen (aufgefallen beim Scalping Bot).
+async function checkLeverageChangeWarning(tradesTable, currentLeverage, newLeverage) {
+  if (currentLeverage === newLeverage) return false;
+  const { rows } = await pgPool.query(`SELECT COUNT(*)::int AS c FROM ${tradesTable}`);
+  return rows[0].c > 0;
+}
+
+// Dynamische Nachkommastellen für Preis-Text (z.B. in Erkennungsgründen),
+// damit sehr günstige Coins (z.B. SHIB im Bereich 0,000005) nicht auf
+// "0.0000" gerundet werden.
+function formatPriceDynamic(value) {
+  const abs = Math.abs(value);
+  const decimals = abs < 0.001 ? 8 : abs < 1 ? 6 : abs < 100 ? 4 : 2;
+  return value.toFixed(decimals);
+}
+
+// ============================================================
+// VWAP BOT - sechster, komplett unabhängiger Paper-Trading-Bot
+// (eigene Strategie, eigener Kapitalschutz, eigene DB-Tabellen "vwap_*").
+//
+// SICHERHEIT: Wie bei den anderen Bots - liest ausschließlich öffentliche
+// Binance-Kursdaten, verändert nur lokal simulierte Werte. NUR SIMULATION.
+//
+// STRATEGIE "VWAP Reversion" auf 5-Minuten-Basis:
+// 1) Tages-VWAP (zurückgesetzt bei UTC-Mitternacht), kumulativ aus
+//    typischem Preis (Hoch+Tief+Schluss)/3 gewichtet mit Volumen.
+// 2) Kurs mindestens 1% vom VWAP entfernt (Standardwert, siehe Erklärung
+//    im Chat - eine coin-relative Volatilitätsschwelle wäre technisch
+//    aufwendiger und wurde nicht stillschweigend stattdessen gebaut).
+// 3) Umkehrkerze (grün bei Long/rot bei Short) mit überdurchschnittlichem
+//    Volumen (>Ø der letzten 10 Kerzen) während die Abweichung noch gilt.
+// 4) SL am Extrempunkt der Abweichung, Mindestabstand 0,2%.
+// 5) TP = Distanz zum VWAP, gedeckelt zwischen 2x und dem konfigurierbaren
+//    RR-Verhältnis (Standard 2,5x) der SL-Distanz - siehe Erklärung im
+//    Chat zur genauen Interpretation dieser Vorgabe.
+// ============================================================
+const VWAP_DEFAULT_SETTINGS = { enabled: false, startCapitalEur: 100, numSlots: 5, leverage: 10, riskRewardRatio: 2.5 };
+
+async function initVwapTradingSchema() {
+  if (!pgPool) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS vwap_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      start_capital_eur NUMERIC NOT NULL DEFAULT 100,
+      num_slots INTEGER NOT NULL DEFAULT 5,
+      leverage INTEGER NOT NULL DEFAULT 10,
+      risk_reward_ratio NUMERIC NOT NULL DEFAULT 2.5,
+      balance_eur NUMERIC NOT NULL DEFAULT 100,
+      watched_symbols TEXT[] NOT NULL DEFAULT ARRAY['BTCUSDT','ETHUSDT','SOLUSDT'],
+      last_check TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS vwap_trades (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      entry_price NUMERIC NOT NULL,
+      stop_loss NUMERIC NOT NULL,
+      take_profit NUMERIC NOT NULL,
+      vwap_at_entry NUMERIC NOT NULL,
+      deviation_extreme NUMERIC NOT NULL,
+      margin_eur NUMERIC NOT NULL,
+      position_size_eur NUMERIC NOT NULL,
+      leverage INTEGER NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      opened_at TIMESTAMPTZ NOT NULL,
+      exit_price NUMERIC,
+      close_reason TEXT,
+      pnl_eur NUMERIC,
+      closed_at TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS vwap_balance_history (
+      id SERIAL PRIMARY KEY, time TIMESTAMPTZ NOT NULL DEFAULT now(), balance NUMERIC NOT NULL
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS vwap_skipped_setups (
+      id UUID PRIMARY KEY, symbol TEXT NOT NULL, direction TEXT NOT NULL, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  const { rows } = await pgPool.query('SELECT id FROM vwap_settings WHERE id = 1');
+  if (!rows.length) {
+    await pgPool.query(
+      `INSERT INTO vwap_settings (id, enabled, start_capital_eur, num_slots, leverage, risk_reward_ratio, balance_eur, watched_symbols)
+       VALUES (1, false, $1, $2, $3, $4, $1, $5)`,
+      [VWAP_DEFAULT_SETTINGS.startCapitalEur, VWAP_DEFAULT_SETTINGS.numSlots, VWAP_DEFAULT_SETTINGS.leverage, VWAP_DEFAULT_SETTINGS.riskRewardRatio,
+       ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT']]
+    );
+    await pgPool.query('INSERT INTO vwap_balance_history (balance) VALUES ($1)', [VWAP_DEFAULT_SETTINGS.startCapitalEur]);
+  }
+}
+
+function vwapRowToSettings(row) {
+  return {
+    enabled: row.enabled, startCapitalEur: Number(row.start_capital_eur), numSlots: Number(row.num_slots),
+    leverage: Number(row.leverage), riskRewardRatio: Number(row.risk_reward_ratio), balanceEur: Number(row.balance_eur),
+    watchedSymbols: row.watched_symbols, lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
+  };
+}
+async function getVwapSettings() {
+  const { rows } = await pgPool.query('SELECT * FROM vwap_settings WHERE id = 1');
+  return vwapRowToSettings(rows[0]);
+}
+function vwapRowToTrade(row) {
+  return {
+    id: row.id, symbol: row.symbol, direction: row.direction, entryPrice: Number(row.entry_price),
+    stopLoss: Number(row.stop_loss), takeProfit: Number(row.take_profit),
+    vwapAtEntry: Number(row.vwap_at_entry), deviationExtreme: Number(row.deviation_extreme),
+    marginEur: Number(row.margin_eur), positionSizeEur: Number(row.position_size_eur), leverage: Number(row.leverage),
+    reason: row.reason, openedAt: new Date(row.opened_at).getTime(),
+    exitPrice: row.exit_price != null ? Number(row.exit_price) : null, closeReason: row.close_reason,
+    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null, closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null
+  };
+}
+
+const vwapLastPrices = {};
+
+// Kumulativer Tages-VWAP (zurückgesetzt bei jedem neuen UTC-Kalendertag).
+function computeDailyVwapSeries(candles) {
+  const out = new Array(candles.length).fill(null);
+  let cumPV = 0, cumVol = 0, currentDay = null;
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const day = new Date(c.time).toISOString().slice(0, 10);
+    if (day !== currentDay) { currentDay = day; cumPV = 0; cumVol = 0; }
+    const typicalPrice = (c.high + c.low + c.close) / 3;
+    cumPV += typicalPrice * c.volume;
+    cumVol += c.volume;
+    out[i] = cumVol > 0 ? cumPV / cumVol : null;
+  }
+  return out;
+}
+
+// Vereinfachte Heuristik. 1%-Schwelle als fester Wert (siehe Erklärung
+// im Chat - eine coin-relative Volatilitätsschwelle wäre eine größere,
+// separate Änderung).
+function detectVwapSetup(candles) {
+  const n = candles.length;
+  if (n < 15) return null;
+  const vwapSeries = computeDailyVwapSeries(candles);
+  const last = candles[n - 1];
+  const vwapNow = vwapSeries[n - 1];
+  if (vwapNow == null || vwapNow <= 0) return null;
+
+  const deviationPct = (last.close - vwapNow) / vwapNow;
+  const priorVolumes = candles.slice(Math.max(0, n - 11), n - 1).map(c => c.volume);
+  const avgVolume = priorVolumes.length ? priorVolumes.reduce((a, b) => a + b, 0) / priorVolumes.length : 0;
+  const isGreen = last.close > last.open;
+  const isRed = last.close < last.open;
+  const highVolume = avgVolume > 0 && last.volume > avgVolume;
+
+  if (deviationPct <= -0.01 && isGreen && highVolume) {
+    let extreme = last.low;
+    for (let i = n - 2; i >= 0 && vwapSeries[i] != null; i--) {
+      if (candles[i].close >= vwapSeries[i]) break;
+      extreme = Math.min(extreme, candles[i].low);
+    }
+    return { direction: 'long', vwap: vwapNow, extreme, entryPrice: last.close, deviationPct };
+  }
+  if (deviationPct >= 0.01 && isRed && highVolume) {
+    let extreme = last.high;
+    for (let i = n - 2; i >= 0 && vwapSeries[i] != null; i--) {
+      if (candles[i].close <= vwapSeries[i]) break;
+      extreme = Math.max(extreme, candles[i].high);
+    }
+    return { direction: 'short', vwap: vwapNow, extreme, entryPrice: last.close, deviationPct };
+  }
+  return null;
+}
+
+// TP-Interpretation (siehe Erklärung im Chat): der konfigurierbare
+// RR-Wert (Standard 2,5) dient als OBERGRENZE für das Vielfache der
+// SL-Distanz; die Untergrenze ist min(2, RR) - damit bleibt "mindestens
+// 2x, höchstens RR-fach" konsistent, auch wenn RR frei geändert wird.
+function computeVwapSlTp(direction, entryPrice, extreme, vwap, riskRewardCap) {
+  const bufferPct = 0.001, minDistPct = 0.002;
+  let stopLoss = direction === 'long' ? extreme * (1 - bufferPct) : extreme * (1 + bufferPct);
+  const distPct = Math.abs(entryPrice - stopLoss) / entryPrice;
+  if (distPct < minDistPct) stopLoss = direction === 'long' ? entryPrice * (1 - minDistPct) : entryPrice * (1 + minDistPct);
+  const distance = Math.abs(entryPrice - stopLoss);
+
+  const floorMultiple = Math.min(2, riskRewardCap);
+  const capMultiple = Math.max(riskRewardCap, floorMultiple);
+  const vwapDistance = Math.abs(vwap - entryPrice);
+  let multiple = distance > 0 ? vwapDistance / distance : floorMultiple;
+  multiple = Math.max(floorMultiple, Math.min(capMultiple, multiple));
+
+  const takeProfit = direction === 'long' ? entryPrice + distance * multiple : entryPrice - distance * multiple;
+  return { stopLoss, takeProfit };
+}
+
+async function checkVwapSymbol(symbol, settings) {
+  const candles = await fetchPaperCandles(symbol, '5m', 288); // ~24h Historie für den Tages-VWAP
+  const lastPrice = candles[candles.length - 1].close;
+  vwapLastPrices[symbol] = lastPrice;
+
+  const { rows: openRows } = await pgPool.query("SELECT * FROM vwap_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  for (const row of openRows) {
+    const trade = vwapRowToTrade(row);
+    let closeReason = null;
+    if (trade.direction === 'long') {
+      if (lastPrice >= trade.takeProfit) closeReason = 'TP'; else if (lastPrice <= trade.stopLoss) closeReason = 'SL';
+    } else {
+      if (lastPrice <= trade.takeProfit) closeReason = 'TP'; else if (lastPrice >= trade.stopLoss) closeReason = 'SL';
+    }
+    if (!closeReason) continue;
+    const exitPrice = lastPrice;
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    await pgPool.query(`UPDATE vwap_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`, [exitPrice, closeReason, pnlEur, trade.id]);
+    const { rows: balRows } = await pgPool.query('UPDATE vwap_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur', [pnlEur]);
+    await pgPool.query('INSERT INTO vwap_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+  }
+
+  const { rows: stillOpen } = await pgPool.query("SELECT COUNT(*)::int AS c FROM vwap_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  if (stillOpen[0].c > 0) return;
+
+  const setup = detectVwapSetup(candles);
+  if (!setup) return;
+
+  const plan = computeVwapSlTp(setup.direction, setup.entryPrice, setup.extreme, setup.vwap, settings.riskRewardRatio);
+  const marginEur = settings.startCapitalEur / settings.numSlots;
+  const { rows: usedRows } = await pgPool.query("SELECT COALESCE(SUM(margin_eur), 0) AS used FROM vwap_trades WHERE status = 'open'");
+  const usedMarginEur = Number(usedRows[0].used);
+
+  const reasonText = `Kurs ${(setup.deviationPct * 100).toFixed(2)}% ${setup.direction === 'long' ? 'unter' : 'über'} Tages-VWAP (${formatPriceDynamic(setup.vwap)}), Umkehrkerze mit überdurchschnittlichem Volumen bei ${formatPriceDynamic(setup.entryPrice)}. Extrempunkt der Abweichung: ${formatPriceDynamic(setup.extreme)}.`;
+
+  if (usedMarginEur + marginEur > settings.balanceEur) {
+    await pgPool.query('INSERT INTO vwap_skipped_setups (id, symbol, direction, reason) VALUES ($1, $2, $3, $4)',
+      [crypto.randomUUID(), symbol, setup.direction, `Kein freier Slot verfügbar (Margin ${marginEur.toFixed(2)}€ würde die Balance überschreiten). ${reasonText}`]);
+    return;
+  }
+
+  const positionSizeEur = marginEur * settings.leverage;
+  await pgPool.query(
+    `INSERT INTO vwap_trades (id, symbol, direction, entry_price, stop_loss, take_profit, vwap_at_entry, deviation_extreme, margin_eur, position_size_eur, leverage, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, plan.stopLoss, plan.takeProfit, setup.vwap, setup.extreme, marginEur, positionSizeEur, settings.leverage, reasonText]
+  );
+}
+
+async function runVwapTradingCycle() {
+  if (!pgPool) return;
+  const settings = await getVwapSettings();
+  if (!settings.enabled) return;
+  for (const symbol of settings.watchedSymbols) {
+    try { await checkVwapSymbol(symbol, settings); } catch (err) { console.error(`VWAP-Bot-Fehler bei ${symbol}:`, err.message || err); }
+    await sleep(150);
+  }
+  await pgPool.query('UPDATE vwap_settings SET last_check = now() WHERE id = 1');
+}
+
+const VWAP_CHECK_INTERVAL_MS = 150 * 1000; // 2,5 Minuten (Vorgabe: 2-3 Min)
+setInterval(runVwapTradingCycle, VWAP_CHECK_INTERVAL_MS);
+
+app.get('/api/vwap-trading/state', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - VWAP Bot nicht verfügbar.' });
+  try {
+    const settings = await getVwapSettings();
+    const { rows: openRows } = await pgPool.query("SELECT * FROM vwap_trades WHERE status = 'open' ORDER BY opened_at DESC");
+    const { rows: closedRows } = await pgPool.query("SELECT * FROM vwap_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
+    const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM vwap_balance_history ORDER BY time ASC');
+    const { rows: skippedRows } = await pgPool.query('SELECT * FROM vwap_skipped_setups ORDER BY created_at DESC LIMIT 50');
+
+    const openTrades = openRows.map(vwapRowToTrade).map(t => {
+      const currentPrice = vwapLastPrices[t.symbol] ?? null;
+      let unrealizedPnlEur = null;
+      if (currentPrice != null) {
+        unrealizedPnlEur = t.direction === 'long'
+          ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
+          : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
+      }
+      return { ...t, currentPrice, unrealizedPnlEur };
+    });
+    const closedTrades = closedRows.map(vwapRowToTrade);
+    const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
+    const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
+
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: VWAP_CHECK_INTERVAL_MS });
+  } catch (err) {
+    console.error('VWAP Bot: state-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/vwap-trading/settings', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - VWAP Bot nicht verfügbar.' });
+  try {
+    const incoming = req.body || {};
+    const current = await getVwapSettings();
+    const wasEnabled = current.enabled;
+    const next = {
+      enabled: !!incoming.enabled,
+      startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
+      numSlots: Number(incoming.numSlots) >= 1 ? Math.round(Number(incoming.numSlots)) : current.numSlots,
+      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
+      riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : current.riskRewardRatio,
+      watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
+    };
+    const leverageWarning = await checkLeverageChangeWarning('vwap_trades', current.leverage, next.leverage);
+
+    await pgPool.query(
+      `UPDATE vwap_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, risk_reward_ratio = $5, watched_symbols = $6 WHERE id = 1`,
+      [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.riskRewardRatio, next.watchedSymbols]
+    );
+    if (next.enabled && !wasEnabled) runVwapTradingCycle();
+    res.json({ ok: true, settings: next, leverageWarning });
+  } catch (err) {
+    console.error('VWAP Bot: settings-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/vwap-trading/reset', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - VWAP Bot nicht verfügbar.' });
+  try {
+    const settings = await getVwapSettings();
+    await pgPool.query('DELETE FROM vwap_trades');
+    await pgPool.query('DELETE FROM vwap_balance_history');
+    await pgPool.query('DELETE FROM vwap_skipped_setups');
+    await pgPool.query('UPDATE vwap_settings SET balance_eur = $1, last_check = NULL WHERE id = 1', [settings.startCapitalEur]);
+    await pgPool.query('INSERT INTO vwap_balance_history (balance) VALUES ($1)', [settings.startCapitalEur]);
+    Object.keys(vwapLastPrices).forEach(k => delete vwapLastPrices[k]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('VWAP Bot: reset-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/vwap-trading/close/:id', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - VWAP Bot nicht verfügbar.' });
+  try {
+    const { rows } = await pgPool.query("SELECT * FROM vwap_trades WHERE id = $1 AND status = 'open'", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Offener Trade nicht gefunden.' });
+    const trade = vwapRowToTrade(rows[0]);
+
+    let exitPrice, usedLastKnownPrice = false;
+    try {
+      exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol);
+    } catch (err) {
+      const cached = vwapLastPrices[trade.symbol];
+      if (cached == null) return res.status(503).json({ error: `Aktueller Kurs für ${trade.symbol} nicht abrufbar (${err.message}) und kein zwischengespeicherter Preis vorhanden. Bitte später erneut versuchen.` });
+      exitPrice = cached;
+      usedLastKnownPrice = true;
+    }
+
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+
+    await pgPool.query(`UPDATE vwap_trades SET status = 'closed', exit_price = $1, close_reason = 'MANUAL', pnl_eur = $2, closed_at = now() WHERE id = $3`, [exitPrice, pnlEur, trade.id]);
+    const { rows: balRows } = await pgPool.query('UPDATE vwap_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur', [pnlEur]);
+    await pgPool.query('INSERT INTO vwap_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+
+    res.json({ ok: true, exitPrice, pnlEur, usedLastKnownPrice });
+  } catch (err) {
+    console.error('VWAP Bot: manuelles Schließen fehlgeschlagen:', err);
+    res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
+  }
+});
+
 const PORT = process.env.PORT || 5055;
 
 initPaperTradingSchema()
@@ -2619,6 +3000,12 @@ initCandleTradingSchema()
     if (pgPool) console.log('Candlestick Bot: Datenbank-Schema bereit.');
   })
   .catch(err => console.error('Candlestick Bot: Schema-Initialisierung fehlgeschlagen:', err));
+
+initVwapTradingSchema()
+  .then(() => {
+    if (pgPool) console.log('VWAP Bot: Datenbank-Schema bereit.');
+  })
+  .catch(err => console.error('VWAP Bot: Schema-Initialisierung fehlgeschlagen:', err));
 
 app.listen(PORT, () => {
   console.log(`Jarvis-Server läuft auf http://localhost:${PORT}`);
