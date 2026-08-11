@@ -3084,6 +3084,424 @@ app.post('/api/vwap-trading/close/:id', async (req, res) => {
   }
 });
 
+// ============================================================
+// PDH/PDL BOT - siebter, komplett unabhängiger Paper-Trading-Bot
+// (eigene Strategie, eigener Kapitalschutz, eigene DB-Tabellen "pdhpdl_*").
+//
+// SICHERHEIT: Wie bei den anderen Bots - liest ausschließlich öffentliche
+// Binance-Kursdaten, verändert nur lokal simulierte Werte. NUR SIMULATION.
+//
+// STRATEGIE "PDH/PDL Sweep + BOS + FVG-Einstieg":
+// 1) PDH/PDL = Hoch/Tief des VORHERIGEN vollständigen UTC-Kalendertages
+//    (aus 1h-Kerzen), gültig für den ganzen aktuellen Tag.
+// 2) Sweep: Kurs unter-/überschreitet PDL/PDH (Docht reicht).
+// 3) BOS: 5m-Kerze SCHLIESST vollständig über/unter dem letzten lokalen
+//    Pivot, das während der Bewegung zum Sweep-Punkt entstand.
+// 4) FVG an der BOS-Ausbruchskerze (siehe Erklärung im Chat zur
+//    Interpretation "welche 3 Kerzen"), Einstieg als Limit an der
+//    Gap-Kante, gültig für 10 Kerzen ab FVG-Bildung.
+// 5) SL am absoluten Sweep-Extrempunkt (Mindestabstand 0,2%), TP =
+//    konfigurierbares RR (Standard 1:2,5).
+// ============================================================
+const PDHPDL_DEFAULT_SETTINGS = { enabled: false, startCapitalEur: 100, numSlots: 5, leverage: 10, riskRewardRatio: 2.5 };
+
+async function initPdhPdlTradingSchema() {
+  if (!pgPool) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS pdhpdl_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      start_capital_eur NUMERIC NOT NULL DEFAULT 100,
+      num_slots INTEGER NOT NULL DEFAULT 5,
+      leverage INTEGER NOT NULL DEFAULT 10,
+      risk_reward_ratio NUMERIC NOT NULL DEFAULT 2.5,
+      balance_eur NUMERIC NOT NULL DEFAULT 100,
+      watched_symbols TEXT[] NOT NULL DEFAULT ARRAY['BTCUSDT','ETHUSDT','SOLUSDT'],
+      last_check TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS pdhpdl_trades (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      entry_price NUMERIC NOT NULL,
+      stop_loss NUMERIC NOT NULL,
+      take_profit NUMERIC NOT NULL,
+      pdh NUMERIC NOT NULL,
+      pdl NUMERIC NOT NULL,
+      sweep_extreme NUMERIC NOT NULL,
+      bos_level NUMERIC NOT NULL,
+      gap_low NUMERIC NOT NULL,
+      gap_high NUMERIC NOT NULL,
+      margin_eur NUMERIC NOT NULL,
+      position_size_eur NUMERIC NOT NULL,
+      leverage INTEGER NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      opened_at TIMESTAMPTZ NOT NULL,
+      exit_price NUMERIC,
+      close_reason TEXT,
+      pnl_eur NUMERIC,
+      closed_at TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS pdhpdl_balance_history (
+      id SERIAL PRIMARY KEY, time TIMESTAMPTZ NOT NULL DEFAULT now(), balance NUMERIC NOT NULL
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS pdhpdl_skipped_setups (
+      id UUID PRIMARY KEY, symbol TEXT NOT NULL, direction TEXT NOT NULL, reason TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS pdhpdl_check_log (
+      symbol TEXT PRIMARY KEY,
+      stage TEXT NOT NULL DEFAULT 'none',
+      note TEXT,
+      checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  const { rows } = await pgPool.query('SELECT id FROM pdhpdl_settings WHERE id = 1');
+  if (!rows.length) {
+    await pgPool.query(
+      `INSERT INTO pdhpdl_settings (id, enabled, start_capital_eur, num_slots, leverage, risk_reward_ratio, balance_eur, watched_symbols)
+       VALUES (1, false, $1, $2, $3, $4, $1, $5)`,
+      [PDHPDL_DEFAULT_SETTINGS.startCapitalEur, PDHPDL_DEFAULT_SETTINGS.numSlots, PDHPDL_DEFAULT_SETTINGS.leverage, PDHPDL_DEFAULT_SETTINGS.riskRewardRatio,
+       ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT', 'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT']]
+    );
+    await pgPool.query('INSERT INTO pdhpdl_balance_history (balance) VALUES ($1)', [PDHPDL_DEFAULT_SETTINGS.startCapitalEur]);
+  }
+}
+
+function pdhpdlRowToSettings(row) {
+  return {
+    enabled: row.enabled, startCapitalEur: Number(row.start_capital_eur), numSlots: Number(row.num_slots),
+    leverage: Number(row.leverage), riskRewardRatio: Number(row.risk_reward_ratio), balanceEur: Number(row.balance_eur),
+    watchedSymbols: row.watched_symbols, lastCheck: row.last_check ? new Date(row.last_check).getTime() : null
+  };
+}
+async function getPdhPdlSettings() {
+  const { rows } = await pgPool.query('SELECT * FROM pdhpdl_settings WHERE id = 1');
+  return pdhpdlRowToSettings(rows[0]);
+}
+function pdhpdlRowToTrade(row) {
+  return {
+    id: row.id, symbol: row.symbol, direction: row.direction, entryPrice: Number(row.entry_price),
+    stopLoss: Number(row.stop_loss), takeProfit: Number(row.take_profit),
+    pdh: Number(row.pdh), pdl: Number(row.pdl), sweepExtreme: Number(row.sweep_extreme), bosLevel: Number(row.bos_level),
+    gapLow: Number(row.gap_low), gapHigh: Number(row.gap_high),
+    marginEur: Number(row.margin_eur), positionSizeEur: Number(row.position_size_eur), leverage: Number(row.leverage),
+    reason: row.reason, openedAt: new Date(row.opened_at).getTime(),
+    exitPrice: row.exit_price != null ? Number(row.exit_price) : null, closeReason: row.close_reason,
+    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null, closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null
+  };
+}
+
+const pdhpdlLastPrices = {};
+
+// PDH/PDL = Hoch/Tief des vorherigen VOLLSTÄNDIGEN UTC-Kalendertages.
+function computePdhPdl(candles1h) {
+  const days = {};
+  for (const c of candles1h) {
+    const day = new Date(c.time).toISOString().slice(0, 10);
+    if (!days[day]) days[day] = { high: -Infinity, low: Infinity };
+    days[day].high = Math.max(days[day].high, c.high);
+    days[day].low = Math.min(days[day].low, c.low);
+  }
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  if (!days[yesterday]) return null;
+  return { pdh: days[yesterday].high, pdl: days[yesterday].low, date: yesterday };
+}
+
+// Analysiert eine Richtung (Long nach PDL-Sweep / Short nach PDH-Sweep) und
+// gibt entweder ein ausgelöstes Setup zurück oder eine Diagnose, wie weit
+// der Ablauf (Sweep -> BOS -> FVG -> Rücktest) gerade gekommen ist - für
+// den "Letzte Prüfungen"-Bereich.
+// Vereinfachte Heuristik, keine Garantie für korrekte Mustererkennung.
+// Interpretation der FVG-Position (nicht explizit spezifiziert): die drei
+// Kerzen der FVG sind die Kerze vor, die BOS-Kerze selbst und die Kerze
+// danach (K1=BOS-1, K2=BOS, K3=BOS+1) - die gängigste Lesart für "FVG an
+// der Ausbruchskerze".
+function analyzePdhPdlSide(candles, level, direction, highs, lows) {
+  const n = candles.length;
+  const searchStart = Math.max(2, n - 80);
+  let bestStatus = { stage: 'none', note: `Kein ${direction === 'long' ? 'PDL' : 'PDH'}-Sweep in diesem Zeitraum.` };
+
+  for (let sweepIdx = n - 4; sweepIdx >= searchStart; sweepIdx--) {
+    const swept = direction === 'long' ? candles[sweepIdx].low < level : candles[sweepIdx].high > level;
+    if (!swept) continue;
+
+    const pivots = direction === 'long' ? highs.filter(h => h.index < sweepIdx) : lows.filter(l => l.index < sweepIdx);
+    if (!pivots.length) continue;
+    const pivot = pivots[pivots.length - 1];
+
+    let extreme = direction === 'long' ? candles[sweepIdx].low : candles[sweepIdx].high;
+    let bosIndex = -1;
+    for (let j = sweepIdx; j < n; j++) {
+      extreme = direction === 'long' ? Math.min(extreme, candles[j].low) : Math.max(extreme, candles[j].high);
+      const brokeOut = direction === 'long' ? candles[j].close > pivot.price : candles[j].close < pivot.price;
+      if (brokeOut) { bosIndex = j; break; }
+    }
+    if (bosIndex === -1) {
+      bestStatus = { stage: 'sweep', note: `${direction === 'long' ? 'PDL' : 'PDH'}-Sweep erkannt (${formatPriceDynamic(level)}), BOS über/unter Pivot ${formatPriceDynamic(pivot.price)} noch ausstehend.` };
+      continue;
+    }
+
+    const k1i = bosIndex - 1, k3i = bosIndex + 1;
+    if (k1i < 0 || k3i >= n) {
+      bestStatus = { stage: 'bos', note: `BOS über/unter ${formatPriceDynamic(pivot.price)} bestätigt, FVG-Kerzen noch nicht vollständig.` };
+      continue;
+    }
+    const k1 = candles[k1i], k3 = candles[k3i];
+    const validGap = direction === 'long' ? k1.high < k3.low : k1.low > k3.high;
+    if (!validGap) {
+      bestStatus = { stage: 'bos', note: `BOS bestätigt, aber keine gültige FVG an der Ausbruchskerze entstanden.` };
+      continue;
+    }
+    const gapLow = direction === 'long' ? k1.high : k3.high;
+    const gapHigh = direction === 'long' ? k3.low : k1.low;
+
+    const last = candles[n - 1];
+    const age = (n - 1) - k3i;
+    if (age > 10) {
+      bestStatus = { stage: 'expired', note: `FVG (${formatPriceDynamic(gapLow)}-${formatPriceDynamic(gapHigh)}) gebildet, aber innerhalb von 10 Kerzen nicht zurückgetestet - Setup verfallen.` };
+      continue;
+    }
+    if (age <= 0) {
+      bestStatus = { stage: 'fvg_forming', note: `FVG (${formatPriceDynamic(gapLow)}-${formatPriceDynamic(gapHigh)}) gerade entstanden, wartet auf Rücktest.` };
+      continue;
+    }
+    const touchesNow = last.low <= gapHigh && last.high >= gapLow;
+    const prev = candles[n - 2];
+    const touchedBefore = prev.low <= gapHigh && prev.high >= gapLow;
+    if (touchesNow && !touchedBefore) {
+      return {
+        stage: 'triggered', direction, sweepExtreme: extreme, bosLevel: pivot.price, gapLow, gapHigh,
+        entryPrice: direction === 'long' ? gapHigh : gapLow
+      };
+    }
+    bestStatus = { stage: 'fvg_waiting', note: `FVG (${formatPriceDynamic(gapLow)}-${formatPriceDynamic(gapHigh)}) gebildet, wartet auf Rücktest (noch ${10 - age} Kerzen gültig).` };
+  }
+  return bestStatus;
+}
+
+function detectPdhPdlSetup(candles, pdh, pdl) {
+  const { highs, lows } = findLocalExtrema(candles, 4);
+  const longStatus = analyzePdhPdlSide(candles, pdl, 'long', highs, lows);
+  if (longStatus.stage === 'triggered') return longStatus;
+  const shortStatus = analyzePdhPdlSide(candles, pdh, 'short', highs, lows);
+  if (shortStatus.stage === 'triggered') return shortStatus;
+
+  const rank = { none: 0, sweep: 1, bos: 2, fvg_forming: 3, fvg_waiting: 4, expired: 4 };
+  const chosen = (rank[shortStatus.stage] || 0) > (rank[longStatus.stage] || 0) ? shortStatus : longStatus;
+  return { stage: chosen.stage, note: chosen.note };
+}
+
+function computePdhPdlSlTp(direction, entryPrice, sweepExtreme, riskReward) {
+  const bufferPct = 0.001, minDistPct = 0.002;
+  let stopLoss = direction === 'long' ? sweepExtreme * (1 - bufferPct) : sweepExtreme * (1 + bufferPct);
+  const distPct = Math.abs(entryPrice - stopLoss) / entryPrice;
+  if (distPct < minDistPct) stopLoss = direction === 'long' ? entryPrice * (1 - minDistPct) : entryPrice * (1 + minDistPct);
+  const distance = Math.abs(entryPrice - stopLoss);
+  const takeProfit = direction === 'long' ? entryPrice + distance * riskReward : entryPrice - distance * riskReward;
+  return { stopLoss, takeProfit };
+}
+
+async function checkPdhPdlSymbol(symbol, settings) {
+  const candles = await fetchPaperCandles(symbol, '5m', 200);
+  const lastPrice = candles[candles.length - 1].close;
+  pdhpdlLastPrices[symbol] = lastPrice;
+
+  const { rows: openRows } = await pgPool.query("SELECT * FROM pdhpdl_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  for (const row of openRows) {
+    const trade = pdhpdlRowToTrade(row);
+    let closeReason = null;
+    if (trade.direction === 'long') {
+      if (lastPrice >= trade.takeProfit) closeReason = 'TP'; else if (lastPrice <= trade.stopLoss) closeReason = 'SL';
+    } else {
+      if (lastPrice <= trade.takeProfit) closeReason = 'TP'; else if (lastPrice >= trade.stopLoss) closeReason = 'SL';
+    }
+    if (!closeReason) continue;
+    const exitPrice = lastPrice;
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    await pgPool.query(`UPDATE pdhpdl_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`, [exitPrice, closeReason, pnlEur, trade.id]);
+    const { rows: balRows } = await pgPool.query('UPDATE pdhpdl_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur', [pnlEur]);
+    await pgPool.query('INSERT INTO pdhpdl_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+  }
+
+  const { rows: stillOpen } = await pgPool.query("SELECT COUNT(*)::int AS c FROM pdhpdl_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  if (stillOpen[0].c > 0) return;
+
+  const candles1h = await fetchPaperCandles(symbol, '1h', 72);
+  const levels = computePdhPdl(candles1h);
+  if (!levels) {
+    await pgPool.query(
+      `INSERT INTO pdhpdl_check_log (symbol, stage, note, checked_at) VALUES ($1, 'none', $2, now())
+       ON CONFLICT (symbol) DO UPDATE SET stage = 'none', note = $2, checked_at = now()`,
+      [symbol, 'PDH/PDL noch nicht berechenbar (nicht genug Historie für den Vortag).']
+    );
+    return;
+  }
+
+  const result = detectPdhPdlSetup(candles, levels.pdh, levels.pdl);
+  await pgPool.query(
+    `INSERT INTO pdhpdl_check_log (symbol, stage, note, checked_at) VALUES ($1, $2, $3, now())
+     ON CONFLICT (symbol) DO UPDATE SET stage = $2, note = $3, checked_at = now()`,
+    [symbol, result.stage, result.note || (result.stage === 'triggered' ? 'Setup ausgelöst.' : null)]
+  );
+
+  if (result.stage !== 'triggered') return;
+
+  const plan = computePdhPdlSlTp(result.direction, result.entryPrice, result.sweepExtreme, settings.riskRewardRatio);
+  const marginEur = settings.startCapitalEur / settings.numSlots;
+  const { rows: usedRows } = await pgPool.query("SELECT COALESCE(SUM(margin_eur), 0) AS used FROM pdhpdl_trades WHERE status = 'open'");
+  const usedMarginEur = Number(usedRows[0].used);
+
+  const reasonText = `${result.direction === 'long' ? 'PDL' : 'PDH'}-Sweep (${formatPriceDynamic(result.sweepExtreme)}), BOS über/unter ${formatPriceDynamic(result.bosLevel)}, FVG-Rücktest (${formatPriceDynamic(result.gapLow)}-${formatPriceDynamic(result.gapHigh)}) bei ${formatPriceDynamic(result.entryPrice)}. PDH ${formatPriceDynamic(levels.pdh)} / PDL ${formatPriceDynamic(levels.pdl)} (${levels.date}).`;
+
+  if (usedMarginEur + marginEur > settings.balanceEur) {
+    await pgPool.query('INSERT INTO pdhpdl_skipped_setups (id, symbol, direction, reason) VALUES ($1, $2, $3, $4)',
+      [crypto.randomUUID(), symbol, result.direction, `Kein freier Slot verfügbar (Margin ${marginEur.toFixed(2)}€ würde die Balance überschreiten). ${reasonText}`]);
+    return;
+  }
+
+  const positionSizeEur = marginEur * settings.leverage;
+  await pgPool.query(
+    `INSERT INTO pdhpdl_trades (id, symbol, direction, entry_price, stop_loss, take_profit, pdh, pdl, sweep_extreme, bos_level, gap_low, gap_high, margin_eur, position_size_eur, leverage, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 'open', now())`,
+    [crypto.randomUUID(), symbol, result.direction, result.entryPrice, plan.stopLoss, plan.takeProfit, levels.pdh, levels.pdl, result.sweepExtreme, result.bosLevel, result.gapLow, result.gapHigh, marginEur, positionSizeEur, settings.leverage, reasonText]
+  );
+}
+
+async function runPdhPdlTradingCycle() {
+  if (!pgPool) return;
+  const settings = await getPdhPdlSettings();
+  if (!settings.enabled) return;
+  for (const symbol of settings.watchedSymbols) {
+    try { await checkPdhPdlSymbol(symbol, settings); } catch (err) { console.error(`PDH/PDL-Bot-Fehler bei ${symbol}:`, err.message || err); }
+    await sleep(150);
+  }
+  await pgPool.query('UPDATE pdhpdl_settings SET last_check = now() WHERE id = 1');
+}
+
+const PDHPDL_CHECK_INTERVAL_MS = 4 * 60 * 1000; // 4 Minuten (Vorgabe: 3-5 Min)
+setInterval(runPdhPdlTradingCycle, PDHPDL_CHECK_INTERVAL_MS);
+
+app.get('/api/pdhpdl-trading/state', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - PDH/PDL Bot nicht verfügbar.' });
+  try {
+    const settings = await getPdhPdlSettings();
+    const { rows: openRows } = await pgPool.query("SELECT * FROM pdhpdl_trades WHERE status = 'open' ORDER BY opened_at DESC");
+    const { rows: closedRows } = await pgPool.query("SELECT * FROM pdhpdl_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
+    const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM pdhpdl_balance_history ORDER BY time ASC');
+    const { rows: skippedRows } = await pgPool.query('SELECT * FROM pdhpdl_skipped_setups ORDER BY created_at DESC LIMIT 50');
+    const { rows: checkLogRows } = await pgPool.query('SELECT * FROM pdhpdl_check_log ORDER BY checked_at DESC');
+
+    const openTrades = openRows.map(pdhpdlRowToTrade).map(t => {
+      const currentPrice = pdhpdlLastPrices[t.symbol] ?? null;
+      let unrealizedPnlEur = null;
+      if (currentPrice != null) {
+        unrealizedPnlEur = t.direction === 'long'
+          ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
+          : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
+      }
+      return { ...t, currentPrice, unrealizedPnlEur };
+    });
+    const closedTrades = closedRows.map(pdhpdlRowToTrade);
+    const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
+    const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
+    const checkLog = checkLogRows.map(r => ({ symbol: r.symbol, stage: r.stage, note: r.note, checkedAt: new Date(r.checked_at).getTime() }));
+
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PDHPDL_CHECK_INTERVAL_MS });
+  } catch (err) {
+    console.error('PDH/PDL Bot: state-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/pdhpdl-trading/settings', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - PDH/PDL Bot nicht verfügbar.' });
+  try {
+    const incoming = req.body || {};
+    const current = await getPdhPdlSettings();
+    const wasEnabled = current.enabled;
+    const next = {
+      enabled: !!incoming.enabled,
+      startCapitalEur: Number(incoming.startCapitalEur) > 0 ? Number(incoming.startCapitalEur) : current.startCapitalEur,
+      numSlots: Number(incoming.numSlots) >= 1 ? Math.round(Number(incoming.numSlots)) : current.numSlots,
+      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 10 ? Math.round(Number(incoming.leverage)) : current.leverage,
+      riskRewardRatio: Number(incoming.riskRewardRatio) > 0 ? Number(incoming.riskRewardRatio) : current.riskRewardRatio,
+      watchedSymbols: Array.isArray(incoming.watchedSymbols) && incoming.watchedSymbols.length ? incoming.watchedSymbols : current.watchedSymbols
+    };
+    const leverageWarning = await checkLeverageChangeWarning('pdhpdl_trades', current.leverage, next.leverage);
+
+    await pgPool.query(
+      `UPDATE pdhpdl_settings SET enabled = $1, start_capital_eur = $2, num_slots = $3, leverage = $4, risk_reward_ratio = $5, watched_symbols = $6 WHERE id = 1`,
+      [next.enabled, next.startCapitalEur, next.numSlots, next.leverage, next.riskRewardRatio, next.watchedSymbols]
+    );
+    if (next.enabled && !wasEnabled) runPdhPdlTradingCycle();
+    res.json({ ok: true, settings: next, leverageWarning });
+  } catch (err) {
+    console.error('PDH/PDL Bot: settings-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/pdhpdl-trading/reset', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - PDH/PDL Bot nicht verfügbar.' });
+  try {
+    const settings = await getPdhPdlSettings();
+    await pgPool.query('DELETE FROM pdhpdl_trades');
+    await pgPool.query('DELETE FROM pdhpdl_balance_history');
+    await pgPool.query('DELETE FROM pdhpdl_skipped_setups');
+    await pgPool.query('DELETE FROM pdhpdl_check_log');
+    await pgPool.query('UPDATE pdhpdl_settings SET balance_eur = $1, last_check = NULL WHERE id = 1', [settings.startCapitalEur]);
+    await pgPool.query('INSERT INTO pdhpdl_balance_history (balance) VALUES ($1)', [settings.startCapitalEur]);
+    Object.keys(pdhpdlLastPrices).forEach(k => delete pdhpdlLastPrices[k]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('PDH/PDL Bot: reset-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/pdhpdl-trading/close/:id', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert - PDH/PDL Bot nicht verfügbar.' });
+  try {
+    const { rows } = await pgPool.query("SELECT * FROM pdhpdl_trades WHERE id = $1 AND status = 'open'", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Offener Trade nicht gefunden.' });
+    const trade = pdhpdlRowToTrade(rows[0]);
+
+    let exitPrice, usedLastKnownPrice = false;
+    try {
+      exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol);
+    } catch (err) {
+      const cached = pdhpdlLastPrices[trade.symbol];
+      if (cached == null) return res.status(503).json({ error: `Aktueller Kurs für ${trade.symbol} nicht abrufbar (${err.message}) und kein zwischengespeicherter Preis vorhanden. Bitte später erneut versuchen.` });
+      exitPrice = cached;
+      usedLastKnownPrice = true;
+    }
+
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+
+    await pgPool.query(`UPDATE pdhpdl_trades SET status = 'closed', exit_price = $1, close_reason = 'MANUAL', pnl_eur = $2, closed_at = now() WHERE id = $3`, [exitPrice, pnlEur, trade.id]);
+    const { rows: balRows } = await pgPool.query('UPDATE pdhpdl_settings SET balance_eur = balance_eur + $1 WHERE id = 1 RETURNING balance_eur', [pnlEur]);
+    await pgPool.query('INSERT INTO pdhpdl_balance_history (balance) VALUES ($1)', [Number(balRows[0].balance_eur)]);
+
+    res.json({ ok: true, exitPrice, pnlEur, usedLastKnownPrice });
+  } catch (err) {
+    console.error('PDH/PDL Bot: manuelles Schließen fehlgeschlagen:', err);
+    res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
+  }
+});
+
 const PORT = process.env.PORT || 5055;
 
 initPaperTradingSchema()
@@ -3121,6 +3539,12 @@ initVwapTradingSchema()
     if (pgPool) console.log('VWAP Bot: Datenbank-Schema bereit.');
   })
   .catch(err => console.error('VWAP Bot: Schema-Initialisierung fehlgeschlagen:', err));
+
+initPdhPdlTradingSchema()
+  .then(() => {
+    if (pgPool) console.log('PDH/PDL Bot: Datenbank-Schema bereit.');
+  })
+  .catch(err => console.error('PDH/PDL Bot: Schema-Initialisierung fehlgeschlagen:', err));
 
 app.listen(PORT, () => {
   console.log(`Jarvis-Server läuft auf http://localhost:${PORT}`);
