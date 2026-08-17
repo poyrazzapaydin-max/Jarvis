@@ -3281,6 +3281,31 @@ app.post('/api/candle-live-trading/reconcile-now', async (req, res) => {
   }
 });
 
+// Gezielte Löschung einzelner GESCHLOSSENER Trades anhand ihrer IDs - NUR für
+// Datensätze mit nachweislich unzuverlässigen Werten (z.B. Reconciliation
+// ohne echten Exit-Preis, siehe "fallback_entry_price" im Log), damit sie
+// Statistiken wie Gewinnrate nicht verfälschen. Löscht bewusst NUR die
+// Trade-Zeile, NICHT den candle_live_log-Eintrag (der bleibt laut Design
+// dauerhaft und unveränderlich) - stattdessen wird die Löschung selbst
+// geloggt, damit nachvollziehbar bleibt, dass und warum hier eingegriffen
+// wurde. Öffnet NIEMALS offene (status='open') Trades zum Löschen.
+app.post('/api/candle-live-trading/delete-trades', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    if (!ids.length) return res.status(400).json({ error: 'ids (Array) erforderlich.' });
+    const { rows: deleted } = await pgPool.query(
+      "DELETE FROM candle_live_trades WHERE id = ANY($1::uuid[]) AND status = 'closed' RETURNING id, symbol, pnl_eur",
+      [ids]
+    );
+    await logCandleLive('warn', 'trades_deleted', { ids: deleted.map(r => r.id), symbols: deleted.map(r => r.symbol), reason: 'Manuell entfernt - unzuverlässige Werte durch SL/TP-Bug bzw. fehlenden echten Exit-Preis bei Reconciliation.' });
+    res.json({ ok: true, deletedCount: deleted.length, deleted });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: Löschen fehlgeschlagen:', err);
+    res.status(500).json({ error: err.message || 'Löschen fehlgeschlagen.' });
+  }
+});
+
 // Dry-Run: berechnet SL/TP + Margin/Vol für ein hypothetisches Signal mit den
 // AKTUELLEN Einstellungen und dem AKTUELLEN Guthaben, OHNE irgendeine Order
 // auszulösen oder den Bot zu aktivieren. Für die manuelle Kontrolle nach
