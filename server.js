@@ -2946,25 +2946,38 @@ async function getMexcFuturesBalance() {
   return available;
 }
 
+// MEXC Futures nutzt ein anderes Symbol-Format als die Binance-Watchlist
+// ("BTC_USDT" mit Unterstrich statt "BTCUSDT") - alle bestehenden Watchlists
+// sind reine *USDT-Paare, daher reicht ein einfaches Einfügen des Unterstrichs
+// vor "USDT". Ursache des ursprünglichen Bugs: dieses Mapping fehlte komplett,
+// wodurch JEDE Contract-Detail-Abfrage mit "Contract does not exist" (code 1001)
+// von MEXC abgelehnt wurde.
+function toMexcFuturesSymbol(binanceSymbol) {
+  if (binanceSymbol.includes('_')) return binanceSymbol; // bereits im Futures-Format
+  if (!binanceSymbol.endsWith('USDT')) throw new Error(`Unbekanntes Symbol-Format (kein USDT-Paar): ${binanceSymbol}`);
+  return `${binanceSymbol.slice(0, -4)}_USDT`;
+}
+
 const candleLiveContractDetailCache = {}; // symbol -> { data, fetchedAt }
 async function getMexcContractDetail(symbol) {
   const cached = candleLiveContractDetailCache[symbol];
   if (cached && Date.now() - cached.fetchedAt < 60 * 60 * 1000) return cached.data;
-  const upstream = await fetch(`${MEXC_CONTRACT_HOST}/api/v1/contract/detail?symbol=${symbol}`);
+  const mexcSymbol = toMexcFuturesSymbol(symbol);
+  const upstream = await fetch(`${MEXC_CONTRACT_HOST}/api/v1/contract/detail?symbol=${mexcSymbol}`);
   const data = await upstream.json();
-  if (!upstream.ok || data.success === false || !data.data) throw new Error(`Contract-Detail für ${symbol} nicht abrufbar.`);
+  if (!upstream.ok || data.success === false || !data.data) throw new Error(`Contract-Detail für ${symbol} (MEXC: ${mexcSymbol}) nicht abrufbar: HTTP ${upstream.status} - ${JSON.stringify(data)}`);
   candleLiveContractDetailCache[symbol] = { data: data.data, fetchedAt: Date.now() };
   return data.data;
 }
 
 async function mexcSetLeverage(symbol, leverage, positionType) {
   // positionType: 1 = long, 2 = short (MEXC verlangt dies separat vom Order-side beim isolierten Hebel-Setzen)
-  return mexcLiveRequest('POST', '/api/v1/private/position/change_leverage', { symbol, leverage, openType: 1, positionType });
+  return mexcLiveRequest('POST', '/api/v1/private/position/change_leverage', { symbol: toMexcFuturesSymbol(symbol), leverage, openType: 1, positionType });
 }
 
 async function mexcPlaceOrder({ symbol, side, vol, leverage, stopLossPrice, takeProfitPrice }) {
   return mexcLiveRequest('POST', '/api/v1/private/order/create', {
-    symbol, side, vol, leverage, openType: 1, type: 5, // 5 = Market
+    symbol: toMexcFuturesSymbol(symbol), side, vol, leverage, openType: 1, type: 5, // 5 = Market
     stopLossPrice, takeProfitPrice, positionMode: 2 // 2 = One-way laut Nutzer-Angabe
   });
 }
@@ -2973,7 +2986,7 @@ async function mexcClosePositionMarket(symbol, direction, vol) {
   // One-way: side 4 = close long, side 2 = close short
   const side = direction === 'long' ? 4 : 2;
   return mexcLiveRequest('POST', '/api/v1/private/order/create', {
-    symbol, side, vol, openType: 1, type: 5, reduceOnly: true, positionMode: 2
+    symbol: toMexcFuturesSymbol(symbol), side, vol, openType: 1, type: 5, reduceOnly: true, positionMode: 2
   });
 }
 
@@ -3002,7 +3015,7 @@ async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
     }
     for (const row of openRows) {
       const trade = candleLiveRowToTrade(row);
-      const stillOpen = openPositions.some(p => p.symbol === symbol && Number(p.holdVol) > 0);
+      const stillOpen = openPositions.some(p => p.symbol === toMexcFuturesSymbol(symbol) && Number(p.holdVol) > 0);
       if (!stillOpen) {
         // Bei MEXC bereits geschlossen (SL/TP native gegriffen) -> lokal nachziehen.
         let exitPrice = lastPrice;
