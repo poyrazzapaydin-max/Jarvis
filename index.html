@@ -4247,6 +4247,7 @@
                 <label>Hebel (1x - 20x)<input type="number" step="1" min="1" max="20" class="select-input" id="candleLiveLeverage"></label>
                 <label>Stop-Loss (%)<input type="number" step="0.5" min="0.5" max="90" class="select-input" id="candleLiveSlPct"></label>
                 <label>Take-Profit (%)<input type="number" step="0.5" min="0.5" class="select-input" id="candleLiveTpPct"></label>
+                <label>Max. gleiche Richtung (%)<input type="number" step="5" min="50" max="100" class="select-input" id="candleLiveMaxSameDirectionPct"></label>
               </div>
               <div class="quick-action-row" style="margin-top:14px;">
                 <button class="big-analyze-btn live-save-btn" id="candleLiveSaveSettingsBtn" style="padding:11px 24px; font-size:0.8rem;">Live-Einstellungen speichern</button>
@@ -9515,6 +9516,7 @@
       document.getElementById('candleLiveLeverage').value = data.settings.leverage;
       document.getElementById('candleLiveSlPct').value = data.settings.slPct;
       document.getElementById('candleLiveTpPct').value = data.settings.tpPct;
+      document.getElementById('candleLiveMaxSameDirectionPct').value = data.settings.maxSameDirectionPct;
 
       const toggleBtn = document.getElementById('candleLiveEnableToggle');
       toggleBtn.classList.toggle('on', data.settings.enabled);
@@ -9593,7 +9595,8 @@
     const body = {
       leverage: parseInt(document.getElementById('candleLiveLeverage').value, 10),
       slPct: parseFloat(document.getElementById('candleLiveSlPct').value),
-      tpPct: parseFloat(document.getElementById('candleLiveTpPct').value)
+      tpPct: parseFloat(document.getElementById('candleLiveTpPct').value),
+      maxSameDirectionPct: parseFloat(document.getElementById('candleLiveMaxSameDirectionPct').value)
     };
     await fetch('/api/candle-live-trading/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     addFeedEntry('Candlestick-Bot LIVE-Einstellungen gespeichert');

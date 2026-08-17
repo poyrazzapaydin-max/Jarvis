@@ -2788,7 +2788,7 @@ async function getClosedTradeStats(tradesTable) {
 // ============================================================
 
 const CANDLE_LIVE_DEFAULT_SETTINGS = {
-  enabled: false, numSlots: 8, leverage: 10, slPct: 10, tpPct: 20, capitalSafetyPct: 90
+  enabled: false, numSlots: 8, leverage: 10, slPct: 10, tpPct: 20, capitalSafetyPct: 90, maxSameDirectionPct: 60
 };
 const MEXC_CONTRACT_HOST = 'https://contract.mexc.com';
 
@@ -2809,6 +2809,12 @@ async function initCandleLiveTradingSchema() {
       emergency_stop BOOLEAN NOT NULL DEFAULT false
     );
   `);
+  // Nachträglich hinzugefügt (Richtungslimit) - ALTER statt CREATE, da die Tabelle
+  // auf Render bereits existiert und live im Einsatz ist.
+  await pgPool.query(`ALTER TABLE candle_live_settings ADD COLUMN IF NOT EXISTS max_same_direction_pct NUMERIC NOT NULL DEFAULT 60;`);
+  // Einmalige Migrationen (nie wiederholt, nie rückgängig gemacht) - Tabelle
+  // hält fest, welche einmaligen Datenkorrekturen bereits angewendet wurden.
+  await pgPool.query(`CREATE TABLE IF NOT EXISTS candle_live_migrations (id TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
   await pgPool.query(`
     CREATE TABLE IF NOT EXISTS candle_live_trades (
       id UUID PRIMARY KEY,
@@ -2858,6 +2864,21 @@ async function initCandleLiveTradingSchema() {
       [CANDLE_LIVE_DEFAULT_SETTINGS.numSlots, CANDLE_LIVE_DEFAULT_SETTINGS.leverage, CANDLE_LIVE_DEFAULT_SETTINGS.slPct, CANDLE_LIVE_DEFAULT_SETTINGS.tpPct, CANDLE_LIVE_DEFAULT_SETTINGS.capitalSafetyPct]
     );
   }
+
+  // Einmalige Datenkorrektur: alle zum Zeitpunkt dieses Fixes noch offenen
+  // Live-Trades wurden mit der fehlerhaften SL/TP-Formel (nicht durch Hebel
+  // geteilt) eröffnet - ihre gespeicherten SL/TP/PnL-Werte sind dadurch nicht
+  // verlässlich. Wird durch die Migrations-Tabelle garantiert nur EIN einziges
+  // Mal ausgeführt, damit spätere (korrekt berechnete) Trades nie fälschlich
+  // markiert werden, egal wie oft der Server neu deployed/gestartet wird.
+  const { rows: migRows } = await pgPool.query("SELECT id FROM candle_live_migrations WHERE id = 'bugfix_sltp_leverage_note_v1'");
+  if (!migRows.length) {
+    const { rowCount } = await pgPool.query(
+      `UPDATE candle_live_trades SET reason = COALESCE(reason, '') || ' [BUG-HINWEIS: SL/TP-Berechnung fehlerhaft (nicht durch Hebel geteilt), Bug seit behoben - SL/TP/PnL dieses Trades vor dem Fix nicht verlässlich]' WHERE status = 'open'`
+    );
+    await pgPool.query("INSERT INTO candle_live_migrations (id) VALUES ('bugfix_sltp_leverage_note_v1')");
+    if (rowCount > 0) console.log(`Candlestick Bot LIVE: ${rowCount} offene(r) Trade(s) mit SL/TP-Bug-Hinweis markiert.`);
+  }
 }
 
 async function logCandleLive(level, eventType, details) {
@@ -2873,6 +2894,7 @@ function candleLiveRowToSettings(row) {
   return {
     enabled: row.enabled, numSlots: Number(row.num_slots), leverage: Number(row.leverage),
     slPct: Number(row.sl_pct), tpPct: Number(row.tp_pct), capitalSafetyPct: Number(row.capital_safety_pct),
+    maxSameDirectionPct: Number(row.max_same_direction_pct),
     lastCheck: row.last_check ? new Date(row.last_check).getTime() : null,
     lastBalanceEur: row.last_balance_eur != null ? Number(row.last_balance_eur) : null,
     lastBalanceAt: row.last_balance_at ? new Date(row.last_balance_at).getTime() : null,
@@ -2936,14 +2958,21 @@ async function mexcLiveRequest(method, mexcPath, params = {}) {
 
 // Wirft IMMER bei Fehler - Aufrufer dürfen NIEMALS einen Fallback-/
 // Cache-Wert als Berechnungsgrundlage für Live-Kapital verwenden.
+//
+// BUGFIX: nutzt "equity" (Gesamtkapital inkl. bereits in offenen Positionen
+// gebundener Margin) statt "availableBalance" (nur der GERADE FREIE Rest).
+// Mit availableBalance schrumpfte die Slot-Margin mit jedem weiteren Trade,
+// weil bereits gebundene Margin nicht mehr mitgezählt wurde - dadurch bekam
+// jeder folgende Trade eine kleinere Margin als der vorherige, obwohl alle
+// Slots gleich groß sein sollen (Gesamtkapital × 90% / 8 Slots, FEST).
 async function getMexcFuturesBalance() {
   const data = await mexcLiveRequest('GET', '/api/v1/private/account/assets');
   const list = Array.isArray(data.data) ? data.data : [];
   const usdt = list.find(a => a.currency === 'USDT');
   if (!usdt) throw new Error('Kein USDT-Guthaben im MEXC-Futures-Konto gefunden.');
-  const available = Number(usdt.availableBalance);
-  if (!Number.isFinite(available) || available < 0) throw new Error('Ungültiger Guthaben-Wert von MEXC erhalten.');
-  return available;
+  const equity = Number(usdt.equity);
+  if (!Number.isFinite(equity) || equity < 0) throw new Error('Ungültiger Guthaben-Wert (equity) von MEXC erhalten.');
+  return equity;
 }
 
 // MEXC Futures nutzt ein anderes Symbol-Format als die Binance-Watchlist
@@ -2998,38 +3027,56 @@ async function getMexcOpenPositions() {
 // ---- Kapital-/Risikologik + Cycle ----
 const candleLiveLastPrices = {};
 
+// Gleicht ALLE lokal noch als "offen" markierten Live-Trades gegen den
+// tatsächlichen MEXC-Positionsstatus ab - unabhängig davon, ob der Bot
+// gerade aktiv ist oder nicht. Deckt sowohl native SL/TP-Treffer bei MEXC
+// als auch manuelle Eingriffe des Nutzers direkt auf MEXC ab (Bugfix: vorher
+// lief dieser Abgleich nur innerhalb von checkCandleLiveSymbol, also NUR
+// wenn der Bot aktiviert war - manuell auf MEXC geschlossene Positionen
+// blieben in Jarvis dauerhaft als "offen" stehen, sobald der Bot deaktiviert
+// wurde).
+async function reconcileCandleLiveOpenPositions() {
+  if (!pgPool || !MEXC_LIVE_API_KEY || !MEXC_LIVE_API_SECRET) return { checked: 0, closed: 0 };
+  const { rows: openRows } = await pgPool.query("SELECT * FROM candle_live_trades WHERE status = 'open'");
+  if (!openRows.length) return { checked: 0, closed: 0 };
+
+  let openPositions;
+  try {
+    openPositions = await getMexcOpenPositions();
+  } catch (err) {
+    await logCandleLive('error', 'reconciliation_failed', { error: err.message });
+    return { checked: openRows.length, closed: 0, error: err.message };
+  }
+
+  let closed = 0;
+  for (const row of openRows) {
+    const trade = candleLiveRowToTrade(row);
+    const stillOpen = openPositions.some(p => p.symbol === toMexcFuturesSymbol(trade.symbol) && Number(p.holdVol) > 0);
+    if (stillOpen) continue;
+
+    let exitPrice = candleLiveLastPrices[trade.symbol];
+    let priceSource = 'cache';
+    if (exitPrice == null) {
+      try { exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol); priceSource = 'live_ticker'; }
+      catch (err) { exitPrice = trade.entryPrice; priceSource = 'fallback_entry_price'; }
+    }
+    const closeReason = trade.direction === 'long'
+      ? (exitPrice >= trade.takeProfit ? 'TP' : (exitPrice <= trade.stopLoss ? 'SL' : 'MANUAL_MEXC'))
+      : (exitPrice <= trade.takeProfit ? 'TP' : (exitPrice >= trade.stopLoss ? 'SL' : 'MANUAL_MEXC'));
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`, [exitPrice, closeReason, pnlEur, trade.id]);
+    await logCandleLive('info', 'position_closed_by_mexc', { symbol: trade.symbol, tradeId: trade.id, closeReason, pnlEur, priceSource });
+    closed++;
+  }
+  return { checked: openRows.length, closed };
+}
+
 async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
   const candles = await fetchPaperCandles(symbol, '5m', 200);
   const lastPrice = candles[candles.length - 1].close;
   candleLiveLastPrices[symbol] = lastPrice;
-
-  // Offene Live-Trades gegen tatsächliche MEXC-Positionen abgleichen (native SL/TP
-  // können die Position bereits bei MEXC geschlossen haben, ohne dass unser Cycle
-  // das ausgelöst hat).
-  const { rows: openRows } = await pgPool.query("SELECT * FROM candle_live_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
-  if (openRows.length) {
-    let openPositions = [];
-    try { openPositions = await getMexcOpenPositions(); } catch (err) {
-      await logCandleLive('error', 'position_check_failed', { symbol, error: err.message });
-      return; // ohne verlässlichen Positionsstatus keine neue Order in diesem Symbol-Durchlauf
-    }
-    for (const row of openRows) {
-      const trade = candleLiveRowToTrade(row);
-      const stillOpen = openPositions.some(p => p.symbol === toMexcFuturesSymbol(symbol) && Number(p.holdVol) > 0);
-      if (!stillOpen) {
-        // Bei MEXC bereits geschlossen (SL/TP native gegriffen) -> lokal nachziehen.
-        let exitPrice = lastPrice;
-        const closeReason = trade.direction === 'long'
-          ? (lastPrice >= trade.takeProfit ? 'TP' : (lastPrice <= trade.stopLoss ? 'SL' : 'MEXC_CLOSED'))
-          : (lastPrice <= trade.takeProfit ? 'TP' : (lastPrice >= trade.stopLoss ? 'SL' : 'MEXC_CLOSED'));
-        const pnlEur = trade.direction === 'long'
-          ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
-          : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
-        await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`, [exitPrice, closeReason, pnlEur, trade.id]);
-        await logCandleLive('info', 'position_closed_by_mexc', { symbol, tradeId: trade.id, closeReason, pnlEur });
-      }
-    }
-  }
 
   const { rows: stillOpen } = await pgPool.query("SELECT COUNT(*)::int AS c FROM candle_live_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
   if (stillOpen[0].c > 0) return;
@@ -3047,6 +3094,22 @@ async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
 
   if (usedMarginEur + marginPerSlot > usableCapital) {
     await logCandleLive('warn', 'capital_limit_reached', { symbol, direction: setup.direction, marginPerSlot, usedMarginEur, usableCapital });
+    return;
+  }
+
+  // Richtungslimit: verhindert, dass zu viele Slots gleichzeitig in dieselbe
+  // Richtung offen sind (Klumpenrisiko bei einem plötzlichen Gegentrend).
+  // Bezugsgröße ist die feste Slot-Anzahl (nicht die Anzahl aktuell offener
+  // Trades), damit die Grenze unabhängig davon gilt, wie viele Slots gerade
+  // frei sind - z.B. bei 8 Slots und 60% dürfen max. gerundet 5 gleichzeitig
+  // long (oder short) sein.
+  const { rows: dirRows } = await pgPool.query("SELECT direction, COUNT(*)::int AS c FROM candle_live_trades WHERE status = 'open' GROUP BY direction");
+  const longCount = dirRows.find(r => r.direction === 'long')?.c || 0;
+  const shortCount = dirRows.find(r => r.direction === 'short')?.c || 0;
+  const sameDirectionCount = setup.direction === 'long' ? longCount : shortCount;
+  const maxSameDirectionSlots = Math.round(settings.numSlots * (settings.maxSameDirectionPct / 100));
+  if (sameDirectionCount + 1 > maxSameDirectionSlots) {
+    await logCandleLive('warn', 'direction_limit_reached', { symbol, direction: setup.direction, longCount, shortCount, maxSameDirectionSlots, maxSameDirectionPct: settings.maxSameDirectionPct });
     return;
   }
 
@@ -3069,8 +3132,15 @@ async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
     return;
   }
 
-  const stopLoss = setup.direction === 'long' ? setup.entryPrice * (1 - settings.slPct / 100) : setup.entryPrice * (1 + settings.slPct / 100);
-  const takeProfit = setup.direction === 'long' ? setup.entryPrice * (1 + settings.tpPct / 100) : setup.entryPrice * (1 - settings.tpPct / 100);
+  // BUGFIX: slPct/tpPct sind auf die MARGIN bezogen (z.B. "20% Ziel-Gewinn auf
+  // den eingesetzten Betrag"), nicht auf den Kurs. Bei Hebel muss die reale
+  // Kursbewegung durch den Hebel geteilt werden (20% Margin-Ziel / 10x Hebel
+  // = 2% Kursbewegung). Der alte Code wandte slPct/tpPct direkt auf den Kurs
+  // an, was bei 10x Hebel zu einer 10x zu großen Margin-Bewegung führte.
+  const slPriceMovePct = settings.slPct / settings.leverage / 100;
+  const tpPriceMovePct = settings.tpPct / settings.leverage / 100;
+  const stopLoss = setup.direction === 'long' ? setup.entryPrice * (1 - slPriceMovePct) : setup.entryPrice * (1 + slPriceMovePct);
+  const takeProfit = setup.direction === 'long' ? setup.entryPrice * (1 + tpPriceMovePct) : setup.entryPrice * (1 - tpPriceMovePct);
   const positionType = setup.direction === 'long' ? 1 : 2;
   const side = setup.direction === 'long' ? 1 : 3; // 1 = open long, 3 = open short (One-way)
 
@@ -3100,6 +3170,12 @@ async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
 
 async function runCandleLiveTradingCycle() {
   if (!pgPool) return;
+
+  // Abgleich mit dem echten MEXC-Zustand läuft IMMER, auch wenn der Bot gerade
+  // deaktiviert ist oder pausiert wurde - sonst bleiben manuell auf MEXC
+  // geschlossene Positionen in Jarvis fälschlich als "offen" stehen.
+  try { await reconcileCandleLiveOpenPositions(); } catch (err) { console.error('Candlestick Bot LIVE: Reconciliation-Fehler:', err.message || err); }
+
   const settings = await getCandleLiveSettings();
   if (!settings.enabled || !LIVE_TRADING_MASTER_ENABLED || settings.emergencyStop) return;
   if (!MEXC_LIVE_API_KEY || !MEXC_LIVE_API_SECRET) return;
@@ -3187,6 +3263,62 @@ app.get('/api/candle-live-trading/balance-preview', async (req, res) => {
   } catch (err) {
     console.error('Candlestick Bot LIVE: Guthaben-Vorschau fehlgeschlagen:', err);
     res.status(502).json({ error: err.message || 'Guthaben-Abfrage fehlgeschlagen.' });
+  }
+});
+
+// Manueller Sofort-Abgleich mit dem echten MEXC-Positionsstatus - nützlich
+// nach einem manuellen Eingriff des Nutzers direkt auf MEXC, ohne auf den
+// nächsten Hintergrund-Zyklus warten zu müssen. Löst NIEMALS selbst Orders
+// aus, korrigiert nur den lokalen offen/geschlossen-Status.
+app.post('/api/candle-live-trading/reconcile-now', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
+  try {
+    const result = await reconcileCandleLiveOpenPositions();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: manueller Reconcile-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Reconciliation fehlgeschlagen.' });
+  }
+});
+
+// Dry-Run: berechnet SL/TP + Margin/Vol für ein hypothetisches Signal mit den
+// AKTUELLEN Einstellungen und dem AKTUELLEN Guthaben, OHNE irgendeine Order
+// auszulösen oder den Bot zu aktivieren. Für die manuelle Kontrolle nach
+// Bugfixes, bevor der Bot wieder scharf geschaltet wird.
+app.post('/api/candle-live-trading/dry-run-preview', async (req, res) => {
+  if (!MEXC_LIVE_API_KEY || !MEXC_LIVE_API_SECRET) return res.status(400).json({ error: 'MEXC Live-Trading-Key ist serverseitig nicht konfiguriert.' });
+  try {
+    const { symbol, direction, entryPrice } = req.body || {};
+    if (!symbol || !['long', 'short'].includes(direction) || !(Number(entryPrice) > 0)) {
+      return res.status(400).json({ error: 'symbol, direction (long/short) und entryPrice (>0) erforderlich.' });
+    }
+    const settings = await getCandleLiveSettings();
+    const balanceEur = await getMexcFuturesBalance();
+    const usableCapital = balanceEur * (settings.capitalSafetyPct / 100);
+    const marginPerSlot = usableCapital / settings.numSlots;
+    const positionSizeEur = marginPerSlot * settings.leverage;
+
+    const contractDetail = await getMexcContractDetail(symbol);
+    const contractSize = Number(contractDetail.contractSize);
+    const volUnit = Number(contractDetail.volUnit) || 1;
+    const minVol = Number(contractDetail.minVol);
+    const price = Number(entryPrice);
+    const vol = Math.floor((positionSizeEur / price / contractSize) / volUnit) * volUnit;
+
+    const slPriceMovePct = settings.slPct / settings.leverage / 100;
+    const tpPriceMovePct = settings.tpPct / settings.leverage / 100;
+    const stopLoss = direction === 'long' ? price * (1 - slPriceMovePct) : price * (1 + slPriceMovePct);
+    const takeProfit = direction === 'long' ? price * (1 + tpPriceMovePct) : price * (1 - tpPriceMovePct);
+
+    res.json({
+      ok: true, balanceEur, usableCapital, marginPerSlot, positionSizeEur,
+      vol, minVol, meetsMinSize: vol >= minVol && vol > 0,
+      stopLoss, takeProfit, slPriceMovePct: slPriceMovePct * 100, tpPriceMovePct: tpPriceMovePct * 100,
+      note: 'Dry-Run - keine Order wurde ausgelöst.'
+    });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: Dry-Run-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Dry-Run fehlgeschlagen.' });
   }
 });
 
@@ -3295,9 +3427,10 @@ app.post('/api/candle-live-trading/settings', async (req, res) => {
     const next = {
       leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 20 ? Math.round(Number(incoming.leverage)) : current.leverage,
       slPct: Number(incoming.slPct) > 0 && Number(incoming.slPct) < 100 ? Number(incoming.slPct) : current.slPct,
-      tpPct: Number(incoming.tpPct) > 0 ? Number(incoming.tpPct) : current.tpPct
+      tpPct: Number(incoming.tpPct) > 0 ? Number(incoming.tpPct) : current.tpPct,
+      maxSameDirectionPct: Number(incoming.maxSameDirectionPct) >= 50 && Number(incoming.maxSameDirectionPct) <= 100 ? Number(incoming.maxSameDirectionPct) : current.maxSameDirectionPct
     };
-    await pgPool.query('UPDATE candle_live_settings SET leverage = $1, sl_pct = $2, tp_pct = $3 WHERE id = 1', [next.leverage, next.slPct, next.tpPct]);
+    await pgPool.query('UPDATE candle_live_settings SET leverage = $1, sl_pct = $2, tp_pct = $3, max_same_direction_pct = $4 WHERE id = 1', [next.leverage, next.slPct, next.tpPct, next.maxSameDirectionPct]);
     await logCandleLive('info', 'settings_updated', next);
     res.json({ ok: true, settings: next });
   } catch (err) {
