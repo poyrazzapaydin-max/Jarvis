@@ -861,6 +861,7 @@ app.get('/api/paper-trading/state', async (req, res) => {
     const { rows: skippedRows } = await pgPool.query('SELECT * FROM paper_skipped_setups ORDER BY created_at DESC LIMIT 50');
     const { rows: insightRows } = await pgPool.query('SELECT trade_count, insight_text, generated_at FROM paper_insights WHERE id = 1');
     const { rows: checkLogRows } = await pgPool.query('SELECT * FROM paper_check_log ORDER BY checked_at DESC');
+    const closedStats = await getClosedTradeStats('paper_trades');
 
     const openTrades = openRows.map(rowToTrade).map(t => {
       const currentPrice = paperLastPrices[t.symbol] ?? null;
@@ -889,7 +890,7 @@ app.get('/api/paper-trading/state', async (req, res) => {
       checkedAt: new Date(r.checked_at).getTime()
     }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, insights, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PAPER_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, insights, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PAPER_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('Paper-Trading: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -1368,6 +1369,7 @@ app.get('/api/ny-trading/state', async (req, res) => {
     const { rows: closedRows } = await pgPool.query("SELECT * FROM ny_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM ny_balance_history ORDER BY time ASC');
     const { rows: skippedRows } = await pgPool.query('SELECT * FROM ny_skipped_setups ORDER BY created_at DESC LIMIT 50');
+    const closedStats = await getClosedTradeStats('ny_trades');
 
     const openTrades = openRows.map(nyRowToTrade).map(t => {
       const currentPrice = nyLastPrices[t.symbol] ?? null;
@@ -1385,7 +1387,7 @@ app.get('/api/ny-trading/state', async (req, res) => {
       id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime()
     }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: NY_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: NY_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('NY Range Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -1932,6 +1934,7 @@ app.get('/api/scalp-trading/state', async (req, res) => {
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM scalp_balance_history ORDER BY time ASC');
     const { rows: skippedRows } = await pgPool.query('SELECT * FROM scalp_skipped_setups ORDER BY created_at DESC LIMIT 50');
     const { rows: checkLogRows } = await pgPool.query('SELECT * FROM scalp_check_log ORDER BY checked_at DESC');
+    const closedStats = await getClosedTradeStats('scalp_trades');
 
     const openTrades = openRows.map(scalpRowToTrade).map(t => {
       const currentPrice = scalpLastPrices[t.symbol] ?? null;
@@ -1953,7 +1956,7 @@ app.get('/api/scalp-trading/state', async (req, res) => {
       failedCriteria: r.failed_criteria, note: r.note, checkedAt: new Date(r.checked_at).getTime()
     }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: SCALP_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: SCALP_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('Scalping Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -2274,6 +2277,7 @@ app.get('/api/fvg-trading/state', async (req, res) => {
     const { rows: closedRows } = await pgPool.query("SELECT * FROM fvg_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM fvg_balance_history ORDER BY time ASC');
     const { rows: skippedRows } = await pgPool.query('SELECT * FROM fvg_skipped_setups ORDER BY created_at DESC LIMIT 50');
+    const closedStats = await getClosedTradeStats('fvg_trades');
 
     const openTrades = openRows.map(fvgRowToTrade).map(t => {
       const currentPrice = fvgLastPrices[t.symbol] ?? null;
@@ -2289,7 +2293,7 @@ app.get('/api/fvg-trading/state', async (req, res) => {
     const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
     const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: FVG_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: FVG_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('FVG Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -2614,6 +2618,7 @@ app.get('/api/candle-trading/state', async (req, res) => {
     const { rows: closedRows } = await pgPool.query("SELECT * FROM candle_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM candle_balance_history ORDER BY time ASC');
     const { rows: skippedRows } = await pgPool.query('SELECT * FROM candle_skipped_setups ORDER BY created_at DESC LIMIT 50');
+    const closedStats = await getClosedTradeStats('candle_trades');
 
     const openTrades = openRows.map(candleRowToTrade).map(t => {
       const currentPrice = candleLastPrices[t.symbol] ?? null;
@@ -2629,7 +2634,7 @@ app.get('/api/candle-trading/state', async (req, res) => {
     const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
     const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: CANDLE_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: CANDLE_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('Candlestick Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -2721,6 +2726,19 @@ async function checkLeverageChangeWarning(tradesTable, currentLeverage, newLever
   if (currentLeverage === newLeverage) return false;
   const { rows } = await pgPool.query(`SELECT COUNT(*)::int AS c FROM ${tradesTable}`);
   return rows[0].c > 0;
+}
+
+// Gemeinsam für ALLE Bots: echte Gesamtzahl + Gewinnzahl geschlossener
+// Trades OHNE Limit - unabhängig von der auf 200 Einträge begrenzten
+// Liste, die fürs Rendern der "Geschlossene Trades"-Ansicht reicht.
+// Bugfix: "Trades Gesamt"/"Gewinnrate" wurden vorher aus der auf 200
+// gedeckelten Liste berechnet, was bei mehr als 200 Trades zu einer
+// eingefrorenen Anzeige führte (u.a. Scalping/FVG/Candlestick Bot).
+async function getClosedTradeStats(tradesTable) {
+  const { rows } = await pgPool.query(
+    `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE pnl_eur > 0)::int AS wins FROM ${tradesTable} WHERE status = 'closed'`
+  );
+  return { total: rows[0].total, wins: rows[0].wins };
 }
 
 // Dynamische Nachkommastellen für Preis-Text (z.B. in Erkennungsgründen),
@@ -2985,6 +3003,7 @@ app.get('/api/vwap-trading/state', async (req, res) => {
     const { rows: closedRows } = await pgPool.query("SELECT * FROM vwap_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM vwap_balance_history ORDER BY time ASC');
     const { rows: skippedRows } = await pgPool.query('SELECT * FROM vwap_skipped_setups ORDER BY created_at DESC LIMIT 50');
+    const closedStats = await getClosedTradeStats('vwap_trades');
 
     const openTrades = openRows.map(vwapRowToTrade).map(t => {
       const currentPrice = vwapLastPrices[t.symbol] ?? null;
@@ -3000,7 +3019,7 @@ app.get('/api/vwap-trading/state', async (req, res) => {
     const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
     const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: VWAP_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: VWAP_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('VWAP Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -3401,6 +3420,7 @@ app.get('/api/pdhpdl-trading/state', async (req, res) => {
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM pdhpdl_balance_history ORDER BY time ASC');
     const { rows: skippedRows } = await pgPool.query('SELECT * FROM pdhpdl_skipped_setups ORDER BY created_at DESC LIMIT 50');
     const { rows: checkLogRows } = await pgPool.query('SELECT * FROM pdhpdl_check_log ORDER BY checked_at DESC');
+    const closedStats = await getClosedTradeStats('pdhpdl_trades');
 
     const openTrades = openRows.map(pdhpdlRowToTrade).map(t => {
       const currentPrice = pdhpdlLastPrices[t.symbol] ?? null;
@@ -3417,7 +3437,7 @@ app.get('/api/pdhpdl-trading/state', async (req, res) => {
     const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
     const checkLog = checkLogRows.map(r => ({ symbol: r.symbol, stage: r.stage, note: r.note, checkedAt: new Date(r.checked_at).getTime() }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PDHPDL_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PDHPDL_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('PDH/PDL Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });

@@ -7813,9 +7813,10 @@
       resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
 
       const closed = data.closedTrades || [];
-      document.getElementById('atTradeCount').textContent = String(closed.length);
-      const wins = closed.filter(t => t.pnlEur > 0).length;
-      document.getElementById('atWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+      const closedTotal = data.closedTradesTotal ?? closed.length;
+      const closedWins = data.closedTradesWins ?? closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('atTradeCount').textContent = String(closedTotal);
+      document.getElementById('atWinRate').textContent = closedTotal ? `${((closedWins / closedTotal) * 100).toFixed(1)}%` : '--';
 
       atDrawBalanceChart(data.balanceHistory);
 
@@ -8180,9 +8181,10 @@
       resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
 
       const closed = data.closedTrades || [];
-      document.getElementById('nyTradeCount').textContent = String(closed.length);
-      const wins = closed.filter(t => t.pnlEur > 0).length;
-      document.getElementById('nyWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+      const closedTotal = data.closedTradesTotal ?? closed.length;
+      const closedWins = data.closedTradesWins ?? closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('nyTradeCount').textContent = String(closedTotal);
+      document.getElementById('nyWinRate').textContent = closedTotal ? `${((closedWins / closedTotal) * 100).toFixed(1)}%` : '--';
 
       nyDrawBalanceChart(data.balanceHistory);
 
@@ -8520,9 +8522,10 @@
       resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
 
       const closed = data.closedTrades || [];
-      document.getElementById('scalpTradeCount').textContent = String(closed.length);
-      const wins = closed.filter(t => t.pnlEur > 0).length;
-      document.getElementById('scalpWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+      const closedTotal = data.closedTradesTotal ?? closed.length;
+      const closedWins = data.closedTradesWins ?? closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('scalpTradeCount').textContent = String(closedTotal);
+      document.getElementById('scalpWinRate').textContent = closedTotal ? `${((closedWins / closedTotal) * 100).toFixed(1)}%` : '--';
 
       scalpDrawBalanceChart(data.balanceHistory);
 
@@ -8854,9 +8857,10 @@
       resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
 
       const closed = data.closedTrades || [];
-      document.getElementById('fvgTradeCount').textContent = String(closed.length);
-      const wins = closed.filter(t => t.pnlEur > 0).length;
-      document.getElementById('fvgWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+      const closedTotal = data.closedTradesTotal ?? closed.length;
+      const closedWins = data.closedTradesWins ?? closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('fvgTradeCount').textContent = String(closedTotal);
+      document.getElementById('fvgWinRate').textContent = closedTotal ? `${((closedWins / closedTotal) * 100).toFixed(1)}%` : '--';
 
       fvgDrawBalanceChart(data.balanceHistory);
 
@@ -9164,9 +9168,10 @@
       resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
 
       const closed = data.closedTrades || [];
-      document.getElementById('candleTradeCount').textContent = String(closed.length);
-      const wins = closed.filter(t => t.pnlEur > 0).length;
-      document.getElementById('candleWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+      const closedTotal = data.closedTradesTotal ?? closed.length;
+      const closedWins = data.closedTradesWins ?? closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('candleTradeCount').textContent = String(closedTotal);
+      document.getElementById('candleWinRate').textContent = closedTotal ? `${((closedWins / closedTotal) * 100).toFixed(1)}%` : '--';
 
       candleDrawBalanceChart(data.balanceHistory);
 
@@ -9474,9 +9479,10 @@
       resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
 
       const closed = data.closedTrades || [];
-      document.getElementById('vwapTradeCount').textContent = String(closed.length);
-      const wins = closed.filter(t => t.pnlEur > 0).length;
-      document.getElementById('vwapWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+      const closedTotal = data.closedTradesTotal ?? closed.length;
+      const closedWins = data.closedTradesWins ?? closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('vwapTradeCount').textContent = String(closedTotal);
+      document.getElementById('vwapWinRate').textContent = closedTotal ? `${((closedWins / closedTotal) * 100).toFixed(1)}%` : '--';
 
       vwapDrawBalanceChart(data.balanceHistory);
 
@@ -9809,9 +9815,10 @@
       resultEl.className = 'stat-value mono ' + (resultEur >= 0 ? 'up' : 'down');
 
       const closed = data.closedTrades || [];
-      document.getElementById('pdhpdlTradeCount').textContent = String(closed.length);
-      const wins = closed.filter(t => t.pnlEur > 0).length;
-      document.getElementById('pdhpdlWinRate').textContent = closed.length ? `${((wins / closed.length) * 100).toFixed(1)}%` : '--';
+      const closedTotal = data.closedTradesTotal ?? closed.length;
+      const closedWins = data.closedTradesWins ?? closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('pdhpdlTradeCount').textContent = String(closedTotal);
+      document.getElementById('pdhpdlWinRate').textContent = closedTotal ? `${((closedWins / closedTotal) * 100).toFixed(1)}%` : '--';
 
       pdhpdlDrawBalanceChart(data.balanceHistory);
 
