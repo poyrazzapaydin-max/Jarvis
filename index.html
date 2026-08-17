@@ -3036,12 +3036,17 @@
   }
 
   /* ---- Live Trading (echtes Geld) - bewusst klar abweichende Akzentfarbe (rot/orange) ---- */
-  .live-trading-panel {
-    margin-top: 22px;
-    padding: 18px;
+  #view-candlelivebot .portfolio-header,
+  #view-candlelivebot .live-warning-banner,
+  #view-candlelivebot .at-update-row {
+    border-color: rgba(255,61,61,0.3);
+  }
+
+  .live-trading-page {
+    padding: 14px;
     border-radius: 16px;
-    border: 2px solid rgba(255,61,61,0.45);
-    background: linear-gradient(180deg, rgba(255,61,61,0.06), rgba(255,61,61,0.02));
+    border: 2px solid rgba(255,61,61,0.3);
+    background: linear-gradient(180deg, rgba(255,61,61,0.05), rgba(255,61,61,0.015));
   }
 
   .live-title { display: flex; align-items: center; gap: 10px; }
@@ -3506,6 +3511,9 @@
         </div>
         <div class="nav-item" data-view="candlebot">
           <span class="icon">🕯️</span> Candlestick Bot
+        </div>
+        <div class="nav-item" data-view="candlelivebot">
+          <span class="icon">🔴</span> Candlestick LIVE
         </div>
         <div class="nav-item" data-view="vwapbot">
           <span class="icon">📊</span> VWAP Bot
@@ -4210,76 +4218,80 @@
             <div class="trade-list" id="candleSkippedList"><div class="notes-empty">Noch keine übersprungenen Setups.</div></div>
           </div>
 
-          <!-- ============================================================ -->
-          <!-- LIVE TRADING (echtes Geld, MEXC Futures) - optisch klar getrennt -->
-          <!-- ============================================================ -->
-          <div class="live-trading-panel">
-            <div class="portfolio-header">
-              <div>
-                <div class="view-panel-title live-title">🔴 LIVE <span class="live-badge">ECHTES GELD</span></div>
-                <div class="portfolio-claim">Candlestick Bot — MEXC Futures Live-Trading</div>
-              </div>
-              <button class="mini-toggle-btn off live-toggle" id="candleLiveEnableToggle">🔴 LIVE-TRADING AUS</button>
-            </div>
+        </div>
+      </div>
 
-            <div class="live-warning-banner">⚠ LIVE-MODUS — hier wird mit ECHTEM Geld auf deinem MEXC-Futures-Konto gehandelt. Verluste sind real und nicht rückgängig zu machen.</div>
+      <!-- ============================================================ -->
+      <!-- Candlestick Bot LIVE TRADING - eigene Seite (echtes Geld, MEXC Futures) -->
+      <!-- ============================================================ -->
+      <div class="view-flex-col" id="view-candlelivebot" style="display:none;">
+        <div class="portfolio-header">
+          <div>
+            <div class="view-panel-title live-title">🔴 LIVE <span class="live-badge">ECHTES GELD</span></div>
+            <div class="portfolio-claim">Candlestick Bot — MEXC Futures Live-Trading</div>
+          </div>
+          <button class="mini-toggle-btn off live-toggle" id="candleLiveEnableToggle">🔴 LIVE-TRADING AUS</button>
+        </div>
 
-            <div class="live-balance-row">
-              <div class="stat-box live-stat-box">
-                <div class="stat-label">LIVE FUTURES-GUTHABEN</div>
-                <div class="stat-value mono" id="candleLiveBalance">--</div>
-                <div class="live-balance-meta mono" id="candleLiveBalanceMeta">Noch nicht abgerufen.</div>
-              </div>
-              <div class="stat-box live-stat-box"><div class="stat-label">LIVE-ERGEBNIS</div><div class="stat-value mono" id="candleLiveTotalResult">--</div></div>
-              <div class="stat-box live-stat-box"><div class="stat-label">TRADES GESAMT (LIVE)</div><div class="stat-value mono" id="candleLiveTradeCount">--</div></div>
-              <div class="stat-box live-stat-box"><div class="stat-label">GEWINNRATE (LIVE)</div><div class="stat-value mono" id="candleLiveWinRate">--</div></div>
-            </div>
+        <div class="live-warning-banner">⚠ LIVE-MODUS — hier wird mit ECHTEM Geld auf deinem MEXC-Futures-Konto gehandelt. Verluste sind real und nicht rückgängig zu machen.</div>
 
-            <div class="at-update-row">
-              <span class="mono" id="candleLiveUpdateInfo">—</span>
-              <span class="at-countdown-row mono" id="candleLiveCountdownRow">Nächste Prüfung in: —</span>
-              <button class="quick-action-btn danger live-emergency-btn" id="candleLiveEmergencyBtn">🛑 NOTFALL-STOPP</button>
-            </div>
+        <div class="at-update-row">
+          <span class="mono" id="candleLiveUpdateInfo">—</span>
+          <span class="at-countdown-row mono" id="candleLiveCountdownRow">Nächste Prüfung in: —</span>
+          <button class="quick-action-btn danger live-emergency-btn" id="candleLiveEmergencyBtn">🛑 NOTFALL-STOPP</button>
+        </div>
 
-            <div class="panel-card live-inner-card">
-              <div class="panel-title">LIVE-EINSTELLUNGEN <span class="card-title-hint">— Kapital folgt automatisch dem echten Guthaben (8 Slots, 90% Sicherheitsmarge)</span></div>
-              <div class="at-settings-grid">
-                <label>Hebel (1x - 20x)<input type="number" step="1" min="1" max="20" class="select-input" id="candleLiveLeverage"></label>
-                <label>Stop-Loss (%)<input type="number" step="0.5" min="0.5" max="90" class="select-input" id="candleLiveSlPct"></label>
-                <label>Take-Profit (%)<input type="number" step="0.5" min="0.5" class="select-input" id="candleLiveTpPct"></label>
-                <label>Max. gleiche Richtung (%)<input type="number" step="5" min="50" max="100" class="select-input" id="candleLiveMaxSameDirectionPct"></label>
-              </div>
-              <div class="quick-action-row" style="margin-top:14px;">
-                <button class="big-analyze-btn live-save-btn" id="candleLiveSaveSettingsBtn" style="padding:11px 24px; font-size:0.8rem;">Live-Einstellungen speichern</button>
-              </div>
-              <div class="trades-range-info mono" id="candleLiveMasterSwitchInfo"></div>
-            </div>
+        <div class="news-body live-trading-page">
 
-            <div class="panel-card live-inner-card">
-              <div class="panel-title">LIVE FUTURES-GUTHABEN-VERLAUF</div>
-              <div class="portfolio-chart-wrap" style="height:180px;">
-                <canvas id="candleLiveBalanceChart" width="900" height="180"></canvas>
-                <div class="chart-placeholder-msg" id="candleLiveChartPlaceholder">Noch keine Verlaufsdaten.</div>
-              </div>
+          <div class="live-balance-row">
+            <div class="stat-box live-stat-box">
+              <div class="stat-label">LIVE FUTURES-GUTHABEN</div>
+              <div class="stat-value mono" id="candleLiveBalance">--</div>
+              <div class="live-balance-meta mono" id="candleLiveBalanceMeta">Noch nicht abgerufen.</div>
             </div>
+            <div class="stat-box live-stat-box"><div class="stat-label">LIVE-ERGEBNIS</div><div class="stat-value mono" id="candleLiveTotalResult">--</div></div>
+            <div class="stat-box live-stat-box"><div class="stat-label">TRADES GESAMT (LIVE)</div><div class="stat-value mono" id="candleLiveTradeCount">--</div></div>
+            <div class="stat-box live-stat-box"><div class="stat-label">GEWINNRATE (LIVE)</div><div class="stat-value mono" id="candleLiveWinRate">--</div></div>
+          </div>
 
-            <div class="panel-card live-inner-card">
-              <div class="panel-title">OFFENE LIVE-POSITIONEN</div>
-              <div class="at-total-pnl-row" id="candleLiveOpenTotalPnl" style="display:none;">
-                Unrealisierter Gesamt-PnL: <span class="mono" id="candleLiveOpenTotalPnlValue">--</span>
-              </div>
-              <div class="trade-list" id="candleLiveOpenList"><div class="notes-empty">Keine offenen Live-Positionen.</div></div>
+          <div class="panel-card live-inner-card">
+            <div class="panel-title">LIVE-EINSTELLUNGEN <span class="card-title-hint">— Kapital folgt automatisch dem echten Guthaben (8 Slots, 90% Sicherheitsmarge)</span></div>
+            <div class="at-settings-grid">
+              <label>Hebel (1x - 20x)<input type="number" step="1" min="1" max="20" class="select-input" id="candleLiveLeverage"></label>
+              <label>Stop-Loss (%)<input type="number" step="0.5" min="0.5" max="90" class="select-input" id="candleLiveSlPct"></label>
+              <label>Take-Profit (%)<input type="number" step="0.5" min="0.5" class="select-input" id="candleLiveTpPct"></label>
+              <label>Max. gleiche Richtung (%)<input type="number" step="5" min="50" max="100" class="select-input" id="candleLiveMaxSameDirectionPct"></label>
             </div>
+            <div class="quick-action-row" style="margin-top:14px;">
+              <button class="big-analyze-btn live-save-btn" id="candleLiveSaveSettingsBtn" style="padding:11px 24px; font-size:0.8rem;">Live-Einstellungen speichern</button>
+            </div>
+            <div class="trades-range-info mono" id="candleLiveMasterSwitchInfo"></div>
+          </div>
 
-            <div class="panel-card live-inner-card">
-              <div class="panel-title">GESCHLOSSENE LIVE-TRADES</div>
-              <div class="trade-list" id="candleLiveClosedList"><div class="notes-empty">Noch keine geschlossenen Live-Trades.</div></div>
+          <div class="panel-card live-inner-card">
+            <div class="panel-title">LIVE FUTURES-GUTHABEN-VERLAUF</div>
+            <div class="portfolio-chart-wrap" style="height:180px;">
+              <canvas id="candleLiveBalanceChart" width="900" height="180"></canvas>
+              <div class="chart-placeholder-msg" id="candleLiveChartPlaceholder">Noch keine Verlaufsdaten.</div>
             </div>
+          </div>
 
-            <div class="panel-card live-inner-card">
-              <div class="panel-title">LIVE-LOG <span class="card-title-hint">— unveränderlich, jede Order/jeder Fehler wird dauerhaft geloggt</span></div>
-              <div class="trade-list" id="candleLiveLogList"><div class="notes-empty">Noch keine Log-Einträge.</div></div>
+          <div class="panel-card live-inner-card">
+            <div class="panel-title">OFFENE LIVE-POSITIONEN</div>
+            <div class="at-total-pnl-row" id="candleLiveOpenTotalPnl" style="display:none;">
+              Unrealisierter Gesamt-PnL: <span class="mono" id="candleLiveOpenTotalPnlValue">--</span>
             </div>
+            <div class="trade-list" id="candleLiveOpenList"><div class="notes-empty">Keine offenen Live-Positionen.</div></div>
+          </div>
+
+          <div class="panel-card live-inner-card">
+            <div class="panel-title">GESCHLOSSENE LIVE-TRADES</div>
+            <div class="trade-list" id="candleLiveClosedList"><div class="notes-empty">Noch keine geschlossenen Live-Trades.</div></div>
+          </div>
+
+          <div class="panel-card live-inner-card">
+            <div class="panel-title">LIVE-LOG <span class="card-title-hint">— unveränderlich, jede Order/jeder Fehler wird dauerhaft geloggt</span></div>
+            <div class="trade-list" id="candleLiveLogList"><div class="notes-empty">Noch keine Log-Einträge.</div></div>
           </div>
 
         </div>
@@ -4848,6 +4860,7 @@
     scalpbot: document.getElementById('view-scalpbot'),
     fvgbot: document.getElementById('view-fvgbot'),
     candlebot: document.getElementById('view-candlebot'),
+    candlelivebot: document.getElementById('view-candlelivebot'),
     vwapbot: document.getElementById('view-vwapbot'),
     pdhpdlbot: document.getElementById('view-pdhpdlbot'),
     analyse: document.getElementById('view-analyse'),
@@ -4893,7 +4906,7 @@
     if (key === 'candlebot' && typeof loadCandleBotState === 'function') {
       loadCandleBotState();
     }
-    if (key === 'candlebot' && typeof loadCandleLiveBotState === 'function') {
+    if (key === 'candlelivebot' && typeof loadCandleLiveBotState === 'function') {
       loadCandleLiveBotState();
     }
     if (key === 'vwapbot' && typeof loadVwapBotState === 'function') {
@@ -9705,7 +9718,7 @@
   }
   setInterval(updateCandleLiveUpdateInfo, 1000);
   setInterval(() => {
-    if (viewPanels.candlebot && viewPanels.candlebot.style.display !== 'none') loadCandleLiveBotState();
+    if (viewPanels.candlelivebot && viewPanels.candlelivebot.style.display !== 'none') loadCandleLiveBotState();
   }, 30000);
 
   // ============ VWAP BOT (sechster, unabhängiger Paper-Trading-Bot) ============
