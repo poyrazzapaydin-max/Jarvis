@@ -3035,6 +3035,123 @@
     letter-spacing: 0.2px;
   }
 
+  /* ---- Live Trading (echtes Geld) - bewusst klar abweichende Akzentfarbe (rot/orange) ---- */
+  .live-trading-panel {
+    margin-top: 22px;
+    padding: 18px;
+    border-radius: 16px;
+    border: 2px solid rgba(255,61,61,0.45);
+    background: linear-gradient(180deg, rgba(255,61,61,0.06), rgba(255,61,61,0.02));
+  }
+
+  .live-title { display: flex; align-items: center; gap: 10px; }
+
+  .live-badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.62rem;
+    letter-spacing: 1px;
+    padding: 3px 8px;
+    border-radius: 6px;
+    background: rgba(255,61,61,0.18);
+    border: 1px solid rgba(255,61,61,0.5);
+    color: #ff8080;
+    vertical-align: middle;
+  }
+
+  .live-toggle {
+    border-color: rgba(255,61,61,0.5) !important;
+    background: rgba(255,61,61,0.1) !important;
+    color: #ff8f8f !important;
+  }
+  .live-toggle.on {
+    border-color: rgba(255,61,61,0.7) !important;
+    background: rgba(255,61,61,0.22) !important;
+    color: #ffdede !important;
+    box-shadow: 0 0 14px rgba(255,61,61,0.35);
+  }
+
+  .live-warning-banner {
+    margin: 10px 0 14px;
+    padding: 12px 16px;
+    border-radius: 10px;
+    border: 1px solid rgba(255,61,61,0.5);
+    background: rgba(255,61,61,0.1);
+    color: #ffb3b3;
+    font-size: 0.82rem;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+  }
+
+  .live-balance-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 12px;
+  }
+
+  .live-stat-box {
+    border-color: rgba(255,61,61,0.3) !important;
+  }
+
+  .live-balance-meta {
+    font-size: 0.62rem;
+    opacity: 0.65;
+    margin-top: 4px;
+  }
+
+  .live-emergency-btn {
+    margin-left: auto;
+    font-weight: 700;
+    border-color: rgba(255,61,61,0.6) !important;
+    color: #ff9c9c !important;
+  }
+
+  .live-inner-card {
+    border-color: rgba(255,61,61,0.18) !important;
+  }
+
+  .live-save-btn {
+    background: linear-gradient(135deg, #ff3d3d, #ff7a3d) !important;
+  }
+
+  /* ---- Bestätigungs-Modal (generisch, für Live-Trading-Aktivierung / Notfall-Stopp) ---- */
+  .modal-overlay {
+    position: fixed; inset: 0; z-index: 2000;
+    background: rgba(5,8,14,0.72);
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+  }
+  .modal-box {
+    max-width: 520px; width: 100%;
+    background: #10151f;
+    border: 1px solid rgba(255,61,61,0.4);
+    border-radius: 16px;
+    padding: 24px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .modal-box h3 {
+    margin: 0 0 12px; font-size: 1rem; color: #ff9c9c; letter-spacing: 0.3px;
+  }
+  .modal-box p {
+    font-size: 0.85rem; line-height: 1.5; color: #d7dce4; margin: 0 0 10px;
+  }
+  .modal-box .modal-balance {
+    font-family: 'JetBrains Mono', monospace; font-size: 1.3rem; color: #ffd980; margin: 10px 0;
+  }
+  .modal-actions {
+    display: flex; gap: 10px; margin-top: 18px; justify-content: flex-end; flex-wrap: wrap;
+  }
+  .modal-btn-cancel {
+    padding: 10px 18px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15);
+    background: transparent; color: #aab2c0; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
+  }
+  .modal-btn-confirm {
+    padding: 10px 18px; border-radius: 10px; border: 1px solid rgba(255,61,61,0.6);
+    background: linear-gradient(135deg, #ff3d3d, #ff7a3d); color: #fff; cursor: pointer;
+    font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; font-weight: 700;
+  }
+  .modal-btn-confirm:disabled { opacity: 0.4; cursor: not-allowed; }
+
   .at-settings-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
@@ -4093,6 +4210,77 @@
             <div class="trade-list" id="candleSkippedList"><div class="notes-empty">Noch keine übersprungenen Setups.</div></div>
           </div>
 
+          <!-- ============================================================ -->
+          <!-- LIVE TRADING (echtes Geld, MEXC Futures) - optisch klar getrennt -->
+          <!-- ============================================================ -->
+          <div class="live-trading-panel">
+            <div class="portfolio-header">
+              <div>
+                <div class="view-panel-title live-title">🔴 LIVE <span class="live-badge">ECHTES GELD</span></div>
+                <div class="portfolio-claim">Candlestick Bot — MEXC Futures Live-Trading</div>
+              </div>
+              <button class="mini-toggle-btn off live-toggle" id="candleLiveEnableToggle">🔴 LIVE-TRADING AUS</button>
+            </div>
+
+            <div class="live-warning-banner">⚠ LIVE-MODUS — hier wird mit ECHTEM Geld auf deinem MEXC-Futures-Konto gehandelt. Verluste sind real und nicht rückgängig zu machen.</div>
+
+            <div class="live-balance-row">
+              <div class="stat-box live-stat-box">
+                <div class="stat-label">LIVE FUTURES-GUTHABEN</div>
+                <div class="stat-value mono" id="candleLiveBalance">--</div>
+                <div class="live-balance-meta mono" id="candleLiveBalanceMeta">Noch nicht abgerufen.</div>
+              </div>
+              <div class="stat-box live-stat-box"><div class="stat-label">LIVE-ERGEBNIS</div><div class="stat-value mono" id="candleLiveTotalResult">--</div></div>
+              <div class="stat-box live-stat-box"><div class="stat-label">TRADES GESAMT (LIVE)</div><div class="stat-value mono" id="candleLiveTradeCount">--</div></div>
+              <div class="stat-box live-stat-box"><div class="stat-label">GEWINNRATE (LIVE)</div><div class="stat-value mono" id="candleLiveWinRate">--</div></div>
+            </div>
+
+            <div class="at-update-row">
+              <span class="mono" id="candleLiveUpdateInfo">—</span>
+              <span class="at-countdown-row mono" id="candleLiveCountdownRow">Nächste Prüfung in: —</span>
+              <button class="quick-action-btn danger live-emergency-btn" id="candleLiveEmergencyBtn">🛑 NOTFALL-STOPP</button>
+            </div>
+
+            <div class="panel-card live-inner-card">
+              <div class="panel-title">LIVE-EINSTELLUNGEN <span class="card-title-hint">— Kapital folgt automatisch dem echten Guthaben (8 Slots, 90% Sicherheitsmarge)</span></div>
+              <div class="at-settings-grid">
+                <label>Hebel (1x - 20x)<input type="number" step="1" min="1" max="20" class="select-input" id="candleLiveLeverage"></label>
+                <label>Stop-Loss (%)<input type="number" step="0.5" min="0.5" max="90" class="select-input" id="candleLiveSlPct"></label>
+                <label>Take-Profit (%)<input type="number" step="0.5" min="0.5" class="select-input" id="candleLiveTpPct"></label>
+              </div>
+              <div class="quick-action-row" style="margin-top:14px;">
+                <button class="big-analyze-btn live-save-btn" id="candleLiveSaveSettingsBtn" style="padding:11px 24px; font-size:0.8rem;">Live-Einstellungen speichern</button>
+              </div>
+              <div class="trades-range-info mono" id="candleLiveMasterSwitchInfo"></div>
+            </div>
+
+            <div class="panel-card live-inner-card">
+              <div class="panel-title">LIVE FUTURES-GUTHABEN-VERLAUF</div>
+              <div class="portfolio-chart-wrap" style="height:180px;">
+                <canvas id="candleLiveBalanceChart" width="900" height="180"></canvas>
+                <div class="chart-placeholder-msg" id="candleLiveChartPlaceholder">Noch keine Verlaufsdaten.</div>
+              </div>
+            </div>
+
+            <div class="panel-card live-inner-card">
+              <div class="panel-title">OFFENE LIVE-POSITIONEN</div>
+              <div class="at-total-pnl-row" id="candleLiveOpenTotalPnl" style="display:none;">
+                Unrealisierter Gesamt-PnL: <span class="mono" id="candleLiveOpenTotalPnlValue">--</span>
+              </div>
+              <div class="trade-list" id="candleLiveOpenList"><div class="notes-empty">Keine offenen Live-Positionen.</div></div>
+            </div>
+
+            <div class="panel-card live-inner-card">
+              <div class="panel-title">GESCHLOSSENE LIVE-TRADES</div>
+              <div class="trade-list" id="candleLiveClosedList"><div class="notes-empty">Noch keine geschlossenen Live-Trades.</div></div>
+            </div>
+
+            <div class="panel-card live-inner-card">
+              <div class="panel-title">LIVE-LOG <span class="card-title-hint">— unveränderlich, jede Order/jeder Fehler wird dauerhaft geloggt</span></div>
+              <div class="trade-list" id="candleLiveLogList"><div class="notes-empty">Noch keine Log-Einträge.</div></div>
+            </div>
+          </div>
+
         </div>
       </div>
 
@@ -4703,6 +4891,9 @@
     }
     if (key === 'candlebot' && typeof loadCandleBotState === 'function') {
       loadCandleBotState();
+    }
+    if (key === 'candlebot' && typeof loadCandleLiveBotState === 'function') {
+      loadCandleLiveBotState();
     }
     if (key === 'vwapbot' && typeof loadVwapBotState === 'function') {
       loadVwapBotState();
@@ -9090,9 +9281,9 @@
     </div>`;
   }
 
-  function candleDrawBalanceChart(history) {
-    const canvas = document.getElementById('candleBalanceChart');
-    const placeholder = document.getElementById('candleChartPlaceholder');
+  function candleDrawBalanceChart(history, canvasId, placeholderId) {
+    const canvas = document.getElementById(canvasId || 'candleBalanceChart');
+    const placeholder = document.getElementById(placeholderId || 'candleChartPlaceholder');
     if (!canvas) return;
     if (!history || history.length < 2) {
       placeholder.classList.add('show');
@@ -9279,6 +9470,239 @@
   setInterval(updateCandleUpdateInfo, 1000);
   setInterval(() => {
     if (viewPanels.candlebot && viewPanels.candlebot.style.display !== 'none') loadCandleBotState();
+  }, 30000);
+
+  // ============================================================
+  // CANDLESTICK BOT - LIVE TRADING (echtes Geld, MEXC Futures)
+  // ============================================================
+  function showModal(html) {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.id = 'genericModalOverlay';
+    overlay.innerHTML = `<div class="modal-box">${html}</div>`;
+    document.body.appendChild(overlay);
+    return overlay;
+  }
+  function closeModal() {
+    const el = document.getElementById('genericModalOverlay');
+    if (el) el.remove();
+  }
+
+  function candleLiveLogRowHtml(l) {
+    const time = new Date(l.time).toLocaleString('de-DE', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    const levelCls = l.level === 'error' ? 'down' : (l.level === 'warn' ? '' : 'up');
+    let details = '';
+    try { details = l.details ? JSON.stringify(l.details) : ''; } catch (e) { details = ''; }
+    return `<div class="trade-row">
+      <div class="trade-row-top">
+        <span class="trade-sym mono ${levelCls}">${escapeHtml(l.eventType)}</span>
+        <span class="trade-time mono">${time}</span>
+      </div>
+      ${details ? `<div class="at-trade-details-text mono" style="font-size:0.68rem; opacity:0.75;">${escapeHtml(details)}</div>` : ''}
+    </div>`;
+  }
+
+  async function loadCandleLiveBotState() {
+    try {
+      const res = await fetch('/api/candle-live-trading/state');
+      const data = await res.json();
+      if (!res.ok || !data.settings) {
+        const openEl = document.getElementById('candleLiveOpenList');
+        if (openEl) openEl.innerHTML = `<div class="notes-empty">${escapeHtml(data.error || 'Live-Trading nicht verfügbar.')}</div>`;
+        return;
+      }
+
+      document.getElementById('candleLiveLeverage').value = data.settings.leverage;
+      document.getElementById('candleLiveSlPct').value = data.settings.slPct;
+      document.getElementById('candleLiveTpPct').value = data.settings.tpPct;
+
+      const toggleBtn = document.getElementById('candleLiveEnableToggle');
+      toggleBtn.classList.toggle('on', data.settings.enabled);
+      toggleBtn.classList.toggle('off', !data.settings.enabled);
+      toggleBtn.textContent = data.settings.enabled ? '🔴 LIVE-TRADING AN' : '🔴 LIVE-TRADING AUS';
+
+      const balanceEl = document.getElementById('candleLiveBalance');
+      const balanceMetaEl = document.getElementById('candleLiveBalanceMeta');
+      if (data.settings.lastBalanceEur != null) {
+        balanceEl.textContent = `${data.settings.lastBalanceEur.toFixed(2)}€`;
+        balanceMetaEl.textContent = data.settings.lastBalanceAt ? `Zuletzt erfolgreich abgerufen: ${new Date(data.settings.lastBalanceAt).toLocaleTimeString('de-DE')}` : '';
+      } else {
+        balanceEl.textContent = '--';
+        balanceMetaEl.textContent = 'Noch nicht abgerufen.';
+      }
+
+      const closed = data.closedTrades || [];
+      const closedTotal = data.closedTradesTotal ?? closed.length;
+      const closedWins = data.closedTradesWins ?? closed.filter(t => t.pnlEur > 0).length;
+      document.getElementById('candleLiveTradeCount').textContent = String(closedTotal);
+      document.getElementById('candleLiveWinRate').textContent = closedTotal ? `${((closedWins / closedTotal) * 100).toFixed(1)}%` : '--';
+
+      const realizedResult = closed.reduce((sum, t) => sum + (t.pnlEur || 0), 0);
+      const resultEl = document.getElementById('candleLiveTotalResult');
+      resultEl.textContent = `${realizedResult >= 0 ? '+' : ''}${realizedResult.toFixed(2)}€ (realisiert)`;
+      resultEl.className = 'stat-value mono ' + (realizedResult >= 0 ? 'up' : 'down');
+
+      candleDrawBalanceChart(data.balanceHistory, 'candleLiveBalanceChart', 'candleLiveChartPlaceholder');
+
+      const openEl = document.getElementById('candleLiveOpenList');
+      const openTrades = data.openTrades || [];
+      openEl.innerHTML = openTrades.length
+        ? openTrades.map(t => candleTradeRowHtml(t, true)).join('')
+        : '<div class="notes-empty">Keine offenen Live-Positionen.</div>';
+
+      const totalPnlRow = document.getElementById('candleLiveOpenTotalPnl');
+      const totalPnlValue = document.getElementById('candleLiveOpenTotalPnlValue');
+      if (totalPnlRow && totalPnlValue) {
+        if (openTrades.length) {
+          const totalPnl = openTrades.reduce((sum, t) => sum + (t.unrealizedPnlEur || 0), 0);
+          totalPnlValue.textContent = `${totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}€`;
+          totalPnlValue.className = 'mono trade-pnl-big ' + pnlColorClass(totalPnl);
+          totalPnlRow.style.display = 'block';
+        } else {
+          totalPnlRow.style.display = 'none';
+        }
+      }
+
+      const closedEl = document.getElementById('candleLiveClosedList');
+      closedEl.innerHTML = closed.length
+        ? closed.map(t => candleTradeRowHtml(t, false)).join('')
+        : '<div class="notes-empty">Noch keine geschlossenen Live-Trades.</div>';
+
+      const logEl = document.getElementById('candleLiveLogList');
+      const log = data.log || [];
+      logEl.innerHTML = log.length
+        ? log.map(candleLiveLogRowHtml).join('')
+        : '<div class="notes-empty">Noch keine Log-Einträge.</div>';
+
+      const masterInfoEl = document.getElementById('candleLiveMasterSwitchInfo');
+      if (masterInfoEl) {
+        if (!data.mexcLiveKeyConfigured) masterInfoEl.textContent = 'MEXC Live-Trading-Key ist serverseitig noch nicht konfiguriert.';
+        else if (!data.masterSwitchEnabled) masterInfoEl.textContent = 'Server-Master-Schalter ist noch AUS - Live-Trading kann erst nach gemeinsamer Freigabe aktiviert werden.';
+        else masterInfoEl.textContent = 'Master-Schalter freigegeben.';
+      }
+
+      candleLiveLastLoadTime = Date.now();
+      candleLiveNextCheckAt = data.lastCheck && data.checkIntervalMs ? data.lastCheck + data.checkIntervalMs : null;
+      updateCandleLiveUpdateInfo();
+    } catch (err) {
+      console.error('Candlestick Bot LIVE: Laden fehlgeschlagen', err);
+    }
+  }
+
+  async function candleLiveSaveSettings() {
+    const body = {
+      leverage: parseInt(document.getElementById('candleLiveLeverage').value, 10),
+      slPct: parseFloat(document.getElementById('candleLiveSlPct').value),
+      tpPct: parseFloat(document.getElementById('candleLiveTpPct').value)
+    };
+    await fetch('/api/candle-live-trading/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    addFeedEntry('Candlestick-Bot LIVE-Einstellungen gespeichert');
+    loadCandleLiveBotState();
+  }
+  document.getElementById('candleLiveSaveSettingsBtn').addEventListener('click', candleLiveSaveSettings);
+
+  async function openCandleLiveEnableModal() {
+    const previewRes = await fetch('/api/candle-live-trading/balance-preview').then(r => r.json()).catch(() => null);
+    if (!previewRes || !previewRes.ok) {
+      showModal(`
+        <h3>⚠ Guthaben-Abfrage fehlgeschlagen</h3>
+        <p>Das aktuelle MEXC-Futures-Guthaben konnte nicht abgerufen werden${previewRes && previewRes.error ? ': ' + escapeHtml(previewRes.error) : '.'} Live-Trading kann ohne verifiziertes Guthaben nicht aktiviert werden.</p>
+        <div class="modal-actions"><button class="modal-btn-cancel" id="modalCancelBtn">Schließen</button></div>
+      `);
+      document.getElementById('modalCancelBtn').addEventListener('click', closeModal);
+      return;
+    }
+    const overlay = showModal(`
+      <h3>🔴 ECHTES Live-Trading aktivieren?</h3>
+      <p>Du aktivierst ECHTES Trading mit echtem Geld auf deinem MEXC-Futures-Konto.</p>
+      <div class="modal-balance">Aktuelles Futures-Guthaben: ${previewRes.balanceEur.toFixed(2)}€</div>
+      <p>Der Bot nutzt automatisch bis zu 90% davon, verteilt auf 8 Slots. <strong>Verluste sind real und nicht rückgängig zu machen.</strong></p>
+      <div class="modal-actions">
+        <button class="modal-btn-cancel" id="modalCancelBtn">Abbrechen</button>
+        <button class="modal-btn-confirm" id="modalConfirmBtn">Verstanden, Live-Trading aktivieren</button>
+      </div>
+    `);
+    document.getElementById('modalCancelBtn').addEventListener('click', closeModal);
+    document.getElementById('modalConfirmBtn').addEventListener('click', async () => {
+      const confirmBtn = document.getElementById('modalConfirmBtn');
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = 'Wird aktiviert…';
+      const res = await fetch('/api/candle-live-trading/enable', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmed: true }) }).then(r => r.json());
+      closeModal();
+      if (!res.ok) {
+        alert(`Live-Trading konnte nicht aktiviert werden: ${res.error || 'Unbekannter Fehler.'}`);
+      } else {
+        addFeedEntry('Candlestick Bot: LIVE-Trading aktiviert');
+      }
+      loadCandleLiveBotState();
+    });
+  }
+
+  document.getElementById('candleLiveEnableToggle').addEventListener('click', async () => {
+    const btn = document.getElementById('candleLiveEnableToggle');
+    if (btn.classList.contains('on')) {
+      await fetch('/api/candle-live-trading/disable', { method: 'POST' });
+      addFeedEntry('Candlestick Bot: LIVE-Trading deaktiviert');
+      loadCandleLiveBotState();
+    } else {
+      openCandleLiveEnableModal();
+    }
+  });
+
+  document.getElementById('candleLiveEmergencyBtn').addEventListener('click', () => {
+    const overlay = showModal(`
+      <h3>🛑 NOTFALL-STOPP</h3>
+      <p>Es werden sofort keine neuen Live-Trades mehr eröffnet.</p>
+      <p>Sollen alle aktuell offenen Live-Positionen sofort per Market-Order geschlossen werden?</p>
+      <div class="modal-actions">
+        <button class="modal-btn-cancel" id="modalStopOnlyBtn">Nur stoppen (Positionen offen lassen)</button>
+        <button class="modal-btn-confirm" id="modalCloseAllBtn">Ja, alle Positionen sofort schließen</button>
+      </div>
+    `);
+    document.getElementById('modalStopOnlyBtn').addEventListener('click', async () => {
+      closeModal();
+      await fetch('/api/candle-live-trading/emergency-stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ closeOpenPositions: false }) });
+      addFeedEntry('Candlestick Bot: NOTFALL-STOPP ausgelöst (Positionen bleiben offen)');
+      loadCandleLiveBotState();
+    });
+    document.getElementById('modalCloseAllBtn').addEventListener('click', async () => {
+      closeModal();
+      await fetch('/api/candle-live-trading/emergency-stop', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ closeOpenPositions: true }) });
+      addFeedEntry('Candlestick Bot: NOTFALL-STOPP ausgelöst, alle Positionen geschlossen');
+      loadCandleLiveBotState();
+    });
+  });
+
+  document.getElementById('candleLiveOpenList').addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-action="close"]');
+    if (!btn) return;
+    if (!confirm('Diese Live-Position wirklich JETZT zum Marktpreis schließen? Das ist eine echte Order.')) return;
+    const res = await fetch(`/api/candle-live-trading/close/${btn.dataset.id}`, { method: 'POST' }).then(r => r.json());
+    if (!res.ok) alert(`Schließen fehlgeschlagen: ${res.error || 'Unbekannter Fehler.'}`);
+    loadCandleLiveBotState();
+  });
+
+  let candleLiveLastLoadTime = null;
+  let candleLiveNextCheckAt = null;
+  function updateCandleLiveUpdateInfo() {
+    const el = document.getElementById('candleLiveUpdateInfo');
+    if (el && candleLiveLastLoadTime) {
+      const secs = Math.round((Date.now() - candleLiveLastLoadTime) / 1000);
+      el.textContent = secs < 2 ? 'Gerade aktualisiert' : `Aktualisiert vor ${secs}s`;
+    }
+    const cdEl = document.getElementById('candleLiveCountdownRow');
+    if (cdEl) {
+      if (candleLiveNextCheckAt) {
+        const remainingSecs = Math.round((candleLiveNextCheckAt - Date.now()) / 1000);
+        cdEl.textContent = remainingSecs > 0 ? `Nächste Prüfung in: ${remainingSecs}s` : 'Nächste Prüfung: läuft gerade…';
+      } else {
+        cdEl.textContent = 'Nächste Prüfung in: —';
+      }
+    }
+  }
+  setInterval(updateCandleLiveUpdateInfo, 1000);
+  setInterval(() => {
+    if (viewPanels.candlebot && viewPanels.candlebot.style.display !== 'none') loadCandleLiveBotState();
   }, 30000);
 
   // ============ VWAP BOT (sechster, unabhängiger Paper-Trading-Bot) ============

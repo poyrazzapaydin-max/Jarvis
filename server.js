@@ -33,6 +33,13 @@ const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const MEXC_API_KEY = process.env.MEXC_API_KEY || '';
 const MEXC_API_SECRET = process.env.MEXC_API_SECRET || '';
 const DATABASE_URL = process.env.DATABASE_URL || '';
+// ---- Live-Trading (Candlestick Bot, echtes Geld) - separater Key, separater Master-Schalter ----
+// Der Master-Schalter wird NUR nach expliziter Freigabe durch den Nutzer im Chat gesetzt.
+// Solange er nicht exakt "true" ist, lehnt /api/candle-live-trading/enable jede Aktivierung ab,
+// unabhängig davon was im Frontend geklickt wird.
+const MEXC_LIVE_API_KEY = process.env.MEXC_LIVE_API_KEY || '';
+const MEXC_LIVE_API_SECRET = process.env.MEXC_LIVE_API_SECRET || '';
+const LIVE_TRADING_MASTER_ENABLED = process.env.LIVE_TRADING_MASTER_ENABLED === 'true';
 
 // ---- Postgres-Verbindung (für Auto-Trader / Paper-Trading-Daten) ----
 // Render-Postgres verlangt SSL, erlaubt aber kein eigenes Zertifikat -
@@ -2752,6 +2759,540 @@ async function getClosedTradeStats(tradesTable) {
   };
 }
 
+// ============================================================
+// CANDLESTICK BOT - LIVE TRADING (echtes Geld, MEXC Futures)
+// ============================================================
+// KRITISCH: Dieser Block platziert ECHTE Orders mit ECHTEM Geld auf dem
+// MEXC-Futures-Konto des Nutzers, sobald ALLE der folgenden Bedingungen
+// erfüllt sind:
+//   1) candle_live_settings.enabled = true (User-Toggle im Frontend)
+//   2) LIVE_TRADING_MASTER_ENABLED === true (Server-Master-Schalter,
+//      wird NUR nach expliziter Freigabe im Chat vom Betreiber gesetzt)
+//   3) candle_live_settings.emergency_stop = false
+//   4) MEXC_LIVE_API_KEY / MEXC_LIVE_API_SECRET sind konfiguriert
+//   5) candle_settings.enabled (Paper-Modus desselben Bots) = false
+// Nutzt dieselbe, unveränderte Mustererkennung wie der Paper-Bot
+// (isBullishEngulfing/isBearishEngulfing/isHammer/isShootingStar/
+// detectCandleSetup, siehe oben).
+//
+// SICHERHEITSPRINZIPIEN (nicht verhandelbar, siehe Auftrag des Nutzers):
+// - Kapitalbasis ist IMMER das live abgefragte MEXC-Futures-Guthaben,
+//   NIE ein gespeicherter/geschätzter Wert. Schlägt die Abfrage fehl,
+//   wird der komplette Zyklus ohne neue Order abgebrochen und geloggt.
+// - Feste 8 Slots, Sicherheitsmarge: nur 90% des Guthabens wird verplant.
+// - SL fix 10%, TP fix 20% vom Einstiegspreis, nativ bei MEXC als
+//   stopLossPrice/takeProfitPrice mitgegeben (schützt auch bei
+//   Server-Ausfall).
+// - candle_live_log ist NUR-EINFÜGEN (insert-only) - kein Endpunkt
+//   erlaubt UPDATE/DELETE auf dieser Tabelle.
+// ============================================================
+
+const CANDLE_LIVE_DEFAULT_SETTINGS = {
+  enabled: false, numSlots: 8, leverage: 10, slPct: 10, tpPct: 20, capitalSafetyPct: 90
+};
+const MEXC_CONTRACT_HOST = 'https://contract.mexc.com';
+
+async function initCandleLiveTradingSchema() {
+  if (!pgPool) return;
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS candle_live_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      enabled BOOLEAN NOT NULL DEFAULT false,
+      num_slots INTEGER NOT NULL DEFAULT 8,
+      leverage INTEGER NOT NULL DEFAULT 10,
+      sl_pct NUMERIC NOT NULL DEFAULT 10,
+      tp_pct NUMERIC NOT NULL DEFAULT 20,
+      capital_safety_pct NUMERIC NOT NULL DEFAULT 90,
+      last_check TIMESTAMPTZ,
+      last_balance_eur NUMERIC,
+      last_balance_at TIMESTAMPTZ,
+      emergency_stop BOOLEAN NOT NULL DEFAULT false
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS candle_live_trades (
+      id UUID PRIMARY KEY,
+      symbol TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      entry_price NUMERIC NOT NULL,
+      stop_loss NUMERIC NOT NULL,
+      take_profit NUMERIC NOT NULL,
+      pattern TEXT NOT NULL,
+      signal_extreme NUMERIC NOT NULL,
+      margin_eur NUMERIC NOT NULL,
+      position_size_eur NUMERIC NOT NULL,
+      leverage INTEGER NOT NULL,
+      vol NUMERIC NOT NULL,
+      mexc_order_id TEXT,
+      mexc_position_id TEXT,
+      is_live BOOLEAN NOT NULL DEFAULT true,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'open',
+      opened_at TIMESTAMPTZ NOT NULL,
+      exit_price NUMERIC,
+      close_reason TEXT,
+      pnl_eur NUMERIC,
+      closed_at TIMESTAMPTZ
+    );
+  `);
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS candle_live_balance_history (
+      id SERIAL PRIMARY KEY, time TIMESTAMPTZ NOT NULL DEFAULT now(), balance NUMERIC NOT NULL
+    );
+  `);
+  // Insert-only Audit-Log - bewusst kein UPDATE/DELETE-Endpunkt vorgesehen.
+  await pgPool.query(`
+    CREATE TABLE IF NOT EXISTS candle_live_log (
+      id SERIAL PRIMARY KEY,
+      time TIMESTAMPTZ NOT NULL DEFAULT now(),
+      level TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      details JSONB
+    );
+  `);
+  const { rows } = await pgPool.query('SELECT id FROM candle_live_settings WHERE id = 1');
+  if (!rows.length) {
+    await pgPool.query(
+      `INSERT INTO candle_live_settings (id, enabled, num_slots, leverage, sl_pct, tp_pct, capital_safety_pct, emergency_stop)
+       VALUES (1, false, $1, $2, $3, $4, $5, false)`,
+      [CANDLE_LIVE_DEFAULT_SETTINGS.numSlots, CANDLE_LIVE_DEFAULT_SETTINGS.leverage, CANDLE_LIVE_DEFAULT_SETTINGS.slPct, CANDLE_LIVE_DEFAULT_SETTINGS.tpPct, CANDLE_LIVE_DEFAULT_SETTINGS.capitalSafetyPct]
+    );
+  }
+}
+
+async function logCandleLive(level, eventType, details) {
+  if (!pgPool) return;
+  try {
+    await pgPool.query('INSERT INTO candle_live_log (level, event_type, details) VALUES ($1, $2, $3)', [level, eventType, details ? JSON.stringify(details) : null]);
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: Log-Fehler:', err.message || err);
+  }
+}
+
+function candleLiveRowToSettings(row) {
+  return {
+    enabled: row.enabled, numSlots: Number(row.num_slots), leverage: Number(row.leverage),
+    slPct: Number(row.sl_pct), tpPct: Number(row.tp_pct), capitalSafetyPct: Number(row.capital_safety_pct),
+    lastCheck: row.last_check ? new Date(row.last_check).getTime() : null,
+    lastBalanceEur: row.last_balance_eur != null ? Number(row.last_balance_eur) : null,
+    lastBalanceAt: row.last_balance_at ? new Date(row.last_balance_at).getTime() : null,
+    emergencyStop: row.emergency_stop
+  };
+}
+async function getCandleLiveSettings() {
+  const { rows } = await pgPool.query('SELECT * FROM candle_live_settings WHERE id = 1');
+  return candleLiveRowToSettings(rows[0]);
+}
+function candleLiveRowToTrade(row) {
+  return {
+    id: row.id, symbol: row.symbol, direction: row.direction, entryPrice: Number(row.entry_price),
+    stopLoss: Number(row.stop_loss), takeProfit: Number(row.take_profit),
+    pattern: row.pattern, signalExtreme: Number(row.signal_extreme),
+    marginEur: Number(row.margin_eur), positionSizeEur: Number(row.position_size_eur), leverage: Number(row.leverage),
+    vol: Number(row.vol), mexcOrderId: row.mexc_order_id, mexcPositionId: row.mexc_position_id,
+    reason: row.reason, openedAt: new Date(row.opened_at).getTime(),
+    exitPrice: row.exit_price != null ? Number(row.exit_price) : null, closeReason: row.close_reason,
+    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null, closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null
+  };
+}
+
+// ---- Signierte MEXC-Live-Trading-Funktionen ----
+// Nutzt einen eigenen Key (MEXC_LIVE_API_KEY/SECRET), getrennt vom
+// bestehenden read-only MEXC_API_KEY. Kein genereller Client-Proxy -
+// diese Funktionen sind serverseitig fest verdrahtet.
+function mexcLiveSign(paramString, timestamp) {
+  const signTarget = MEXC_LIVE_API_KEY + timestamp + paramString;
+  return crypto.createHmac('sha256', MEXC_LIVE_API_SECRET).update(signTarget).digest('hex');
+}
+async function mexcLiveRequest(method, mexcPath, params = {}) {
+  if (!MEXC_LIVE_API_KEY || !MEXC_LIVE_API_SECRET) throw new Error('MEXC Live-Trading-Key nicht konfiguriert (MEXC_LIVE_API_KEY/MEXC_LIVE_API_SECRET fehlen).');
+  const timestamp = String(Date.now());
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  try {
+    let url, fetchOpts;
+    if (method === 'GET') {
+      const sortedKeys = Object.keys(params).sort();
+      const paramString = sortedKeys.map(k => `${k}=${params[k]}`).join('&');
+      const signature = mexcLiveSign(paramString, timestamp);
+      url = `${MEXC_CONTRACT_HOST}${mexcPath}${paramString ? '?' + paramString : ''}`;
+      fetchOpts = { method: 'GET', headers: { 'ApiKey': MEXC_LIVE_API_KEY, 'Request-Time': timestamp, 'Signature': signature, 'Content-Type': 'application/json' }, signal: controller.signal };
+    } else {
+      const bodyString = JSON.stringify(params);
+      const signature = mexcLiveSign(bodyString, timestamp);
+      url = `${MEXC_CONTRACT_HOST}${mexcPath}`;
+      fetchOpts = { method: 'POST', headers: { 'ApiKey': MEXC_LIVE_API_KEY, 'Request-Time': timestamp, 'Signature': signature, 'Content-Type': 'application/json' }, body: bodyString, signal: controller.signal };
+    }
+    const upstream = await fetch(url, fetchOpts);
+    const data = await upstream.json();
+    if (!upstream.ok || data.success === false) {
+      throw new Error(`MEXC-API-Fehler bei ${mexcPath}: HTTP ${upstream.status} - ${data.message || JSON.stringify(data)}`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+// Wirft IMMER bei Fehler - Aufrufer dürfen NIEMALS einen Fallback-/
+// Cache-Wert als Berechnungsgrundlage für Live-Kapital verwenden.
+async function getMexcFuturesBalance() {
+  const data = await mexcLiveRequest('GET', '/api/v1/private/account/assets');
+  const list = Array.isArray(data.data) ? data.data : [];
+  const usdt = list.find(a => a.currency === 'USDT');
+  if (!usdt) throw new Error('Kein USDT-Guthaben im MEXC-Futures-Konto gefunden.');
+  const available = Number(usdt.availableBalance);
+  if (!Number.isFinite(available) || available < 0) throw new Error('Ungültiger Guthaben-Wert von MEXC erhalten.');
+  return available;
+}
+
+const candleLiveContractDetailCache = {}; // symbol -> { data, fetchedAt }
+async function getMexcContractDetail(symbol) {
+  const cached = candleLiveContractDetailCache[symbol];
+  if (cached && Date.now() - cached.fetchedAt < 60 * 60 * 1000) return cached.data;
+  const upstream = await fetch(`${MEXC_CONTRACT_HOST}/api/v1/contract/detail?symbol=${symbol}`);
+  const data = await upstream.json();
+  if (!upstream.ok || data.success === false || !data.data) throw new Error(`Contract-Detail für ${symbol} nicht abrufbar.`);
+  candleLiveContractDetailCache[symbol] = { data: data.data, fetchedAt: Date.now() };
+  return data.data;
+}
+
+async function mexcSetLeverage(symbol, leverage, positionType) {
+  // positionType: 1 = long, 2 = short (MEXC verlangt dies separat vom Order-side beim isolierten Hebel-Setzen)
+  return mexcLiveRequest('POST', '/api/v1/private/position/change_leverage', { symbol, leverage, openType: 1, positionType });
+}
+
+async function mexcPlaceOrder({ symbol, side, vol, leverage, stopLossPrice, takeProfitPrice }) {
+  return mexcLiveRequest('POST', '/api/v1/private/order/create', {
+    symbol, side, vol, leverage, openType: 1, type: 5, // 5 = Market
+    stopLossPrice, takeProfitPrice, positionMode: 2 // 2 = One-way laut Nutzer-Angabe
+  });
+}
+
+async function mexcClosePositionMarket(symbol, direction, vol) {
+  // One-way: side 4 = close long, side 2 = close short
+  const side = direction === 'long' ? 4 : 2;
+  return mexcLiveRequest('POST', '/api/v1/private/order/create', {
+    symbol, side, vol, openType: 1, type: 5, reduceOnly: true, positionMode: 2
+  });
+}
+
+async function getMexcOpenPositions() {
+  const data = await mexcLiveRequest('GET', '/api/v1/private/position/open_positions');
+  return Array.isArray(data.data) ? data.data : [];
+}
+
+// ---- Kapital-/Risikologik + Cycle ----
+const candleLiveLastPrices = {};
+
+async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
+  const candles = await fetchPaperCandles(symbol, '5m', 200);
+  const lastPrice = candles[candles.length - 1].close;
+  candleLiveLastPrices[symbol] = lastPrice;
+
+  // Offene Live-Trades gegen tatsächliche MEXC-Positionen abgleichen (native SL/TP
+  // können die Position bereits bei MEXC geschlossen haben, ohne dass unser Cycle
+  // das ausgelöst hat).
+  const { rows: openRows } = await pgPool.query("SELECT * FROM candle_live_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  if (openRows.length) {
+    let openPositions = [];
+    try { openPositions = await getMexcOpenPositions(); } catch (err) {
+      await logCandleLive('error', 'position_check_failed', { symbol, error: err.message });
+      return; // ohne verlässlichen Positionsstatus keine neue Order in diesem Symbol-Durchlauf
+    }
+    for (const row of openRows) {
+      const trade = candleLiveRowToTrade(row);
+      const stillOpen = openPositions.some(p => p.symbol === symbol && Number(p.holdVol) > 0);
+      if (!stillOpen) {
+        // Bei MEXC bereits geschlossen (SL/TP native gegriffen) -> lokal nachziehen.
+        let exitPrice = lastPrice;
+        const closeReason = trade.direction === 'long'
+          ? (lastPrice >= trade.takeProfit ? 'TP' : (lastPrice <= trade.stopLoss ? 'SL' : 'MEXC_CLOSED'))
+          : (lastPrice <= trade.takeProfit ? 'TP' : (lastPrice >= trade.stopLoss ? 'SL' : 'MEXC_CLOSED'));
+        const pnlEur = trade.direction === 'long'
+          ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+          : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+        await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`, [exitPrice, closeReason, pnlEur, trade.id]);
+        await logCandleLive('info', 'position_closed_by_mexc', { symbol, tradeId: trade.id, closeReason, pnlEur });
+      }
+    }
+  }
+
+  const { rows: stillOpen } = await pgPool.query("SELECT COUNT(*)::int AS c FROM candle_live_trades WHERE symbol = $1 AND status = 'open'", [symbol]);
+  if (stillOpen[0].c > 0) return;
+
+  const setup = detectCandleSetup(candles);
+  if (!setup) return;
+
+  const usableCapital = freshBalanceEur * (settings.capitalSafetyPct / 100);
+  const marginPerSlot = usableCapital / settings.numSlots;
+
+  const { rows: usedRows } = await pgPool.query("SELECT COALESCE(SUM(margin_eur), 0) AS used FROM candle_live_trades WHERE status = 'open'");
+  const usedMarginEur = Number(usedRows[0].used);
+
+  const reasonText = `${setup.pattern} erkannt (Signalkerze Extrempunkt ${setup.signalExtreme.toFixed(4)}), Einstieg bei ${setup.entryPrice.toFixed(4)}. [LIVE]`;
+
+  if (usedMarginEur + marginPerSlot > usableCapital) {
+    await logCandleLive('warn', 'capital_limit_reached', { symbol, direction: setup.direction, marginPerSlot, usedMarginEur, usableCapital });
+    return;
+  }
+
+  let contractDetail;
+  try {
+    contractDetail = await getMexcContractDetail(symbol);
+  } catch (err) {
+    await logCandleLive('error', 'contract_detail_failed', { symbol, error: err.message });
+    return;
+  }
+
+  const positionSizeEur = marginPerSlot * settings.leverage;
+  const contractSize = Number(contractDetail.contractSize);
+  const volUnit = Number(contractDetail.volUnit) || 1;
+  const minVol = Number(contractDetail.minVol);
+  let vol = Math.floor((positionSizeEur / setup.entryPrice / contractSize) / volUnit) * volUnit;
+
+  if (!vol || vol < minVol) {
+    await logCandleLive('warn', 'min_order_size_not_reached', { symbol, direction: setup.direction, vol, minVol, positionSizeEur });
+    return;
+  }
+
+  const stopLoss = setup.direction === 'long' ? setup.entryPrice * (1 - settings.slPct / 100) : setup.entryPrice * (1 + settings.slPct / 100);
+  const takeProfit = setup.direction === 'long' ? setup.entryPrice * (1 + settings.tpPct / 100) : setup.entryPrice * (1 - settings.tpPct / 100);
+  const positionType = setup.direction === 'long' ? 1 : 2;
+  const side = setup.direction === 'long' ? 1 : 3; // 1 = open long, 3 = open short (One-way)
+
+  try {
+    await mexcSetLeverage(symbol, settings.leverage, positionType);
+  } catch (err) {
+    await logCandleLive('error', 'set_leverage_failed', { symbol, error: err.message });
+    return;
+  }
+
+  let orderResult;
+  try {
+    orderResult = await mexcPlaceOrder({ symbol, side, vol, leverage: settings.leverage, stopLossPrice: stopLoss, takeProfitPrice: takeProfit });
+  } catch (err) {
+    await logCandleLive('error', 'order_failed', { symbol, direction: setup.direction, vol, error: err.message });
+    return;
+  }
+
+  const orderId = orderResult?.data?.orderId || null;
+  await pgPool.query(
+    `INSERT INTO candle_live_trades (id, symbol, direction, entry_price, stop_loss, take_profit, pattern, signal_extreme, margin_eur, position_size_eur, leverage, vol, mexc_order_id, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, stopLoss, takeProfit, setup.pattern, setup.signalExtreme, marginPerSlot, positionSizeEur, settings.leverage, vol, orderId, reasonText]
+  );
+  await logCandleLive('info', 'order_placed', { symbol, direction: setup.direction, vol, entryPrice: setup.entryPrice, stopLoss, takeProfit, orderId });
+}
+
+async function runCandleLiveTradingCycle() {
+  if (!pgPool) return;
+  const settings = await getCandleLiveSettings();
+  if (!settings.enabled || !LIVE_TRADING_MASTER_ENABLED || settings.emergencyStop) return;
+  if (!MEXC_LIVE_API_KEY || !MEXC_LIVE_API_SECRET) return;
+
+  // Gegenseitiger Ausschluss: Paper-Modus desselben Bots darf nicht gleichzeitig aktiv sein.
+  try {
+    const paperSettings = await getCandleSettings();
+    if (paperSettings.enabled) {
+      await logCandleLive('error', 'mutual_exclusion_violation', { note: 'Paper-Trading war gleichzeitig aktiv - Live-Zyklus übersprungen.' });
+      return;
+    }
+  } catch (err) { /* falls Paper-Settings nicht lesbar sind, trotzdem fortfahren */ }
+
+  let freshBalanceEur;
+  try {
+    freshBalanceEur = await getMexcFuturesBalance();
+  } catch (err) {
+    await logCandleLive('error', 'balance_fetch_failed', { error: err.message });
+    return; // KEIN Fallback-Wert, KEINE neuen Trades in diesem Zyklus
+  }
+  await pgPool.query('UPDATE candle_live_settings SET last_balance_eur = $1, last_balance_at = now() WHERE id = 1', [freshBalanceEur]);
+  await pgPool.query('INSERT INTO candle_live_balance_history (balance) VALUES ($1)', [freshBalanceEur]);
+
+  const watchedSymbols = (await getCandleSettings()).watchedSymbols; // gleiche Watchlist wie Paper-Bot
+
+  for (const symbol of watchedSymbols) {
+    try { await checkCandleLiveSymbol(symbol, settings, freshBalanceEur); } catch (err) {
+      console.error(`Candlestick Bot LIVE: Fehler bei ${symbol}:`, err.message || err);
+      await logCandleLive('error', 'symbol_check_exception', { symbol, error: err.message });
+    }
+    await sleep(150);
+  }
+  await pgPool.query('UPDATE candle_live_settings SET last_check = now() WHERE id = 1');
+}
+
+const CANDLE_LIVE_CHECK_INTERVAL_MS = CANDLE_CHECK_INTERVAL_MS; // gleicher Rhythmus wie Paper-Bot
+setInterval(runCandleLiveTradingCycle, CANDLE_LIVE_CHECK_INTERVAL_MS);
+
+// ---- REST-Endpunkte Live-Trading ----
+
+app.get('/api/candle-live-trading/state', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
+  try {
+    const settings = await getCandleLiveSettings();
+    const { rows: openRows } = await pgPool.query("SELECT * FROM candle_live_trades WHERE status = 'open' ORDER BY opened_at DESC");
+    const { rows: closedRows } = await pgPool.query("SELECT * FROM candle_live_trades WHERE status = 'closed' ORDER BY closed_at DESC LIMIT 200");
+    const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM candle_live_balance_history ORDER BY time ASC');
+    const { rows: logRows } = await pgPool.query('SELECT * FROM candle_live_log ORDER BY time DESC LIMIT 100');
+    const closedStats = await getClosedTradeStats('candle_live_trades');
+
+    const openTrades = openRows.map(candleLiveRowToTrade).map(t => {
+      const currentPrice = candleLiveLastPrices[t.symbol] ?? null;
+      let unrealizedPnlEur = null;
+      if (currentPrice != null) {
+        unrealizedPnlEur = t.direction === 'long'
+          ? (currentPrice - t.entryPrice) / t.entryPrice * t.positionSizeEur
+          : (t.entryPrice - currentPrice) / t.entryPrice * t.positionSizeEur;
+      }
+      return { ...t, currentPrice, unrealizedPnlEur };
+    });
+    const closedTrades = closedRows.map(candleLiveRowToTrade);
+    const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
+    const log = logRows.map(r => ({ id: r.id, time: new Date(r.time).getTime(), level: r.level, eventType: r.event_type, details: r.details }));
+
+    res.json({
+      settings, balanceEur: settings.lastBalanceEur, balanceHistory, openTrades, closedTrades,
+      closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins,
+      closedTradesAvgWin: closedStats.avgWin, closedTradesAvgLoss: closedStats.avgLoss,
+      closedTradesMaxWin: closedStats.maxWin, closedTradesMaxLoss: closedStats.maxLoss,
+      log, lastCheck: settings.lastCheck, checkIntervalMs: CANDLE_LIVE_CHECK_INTERVAL_MS,
+      masterSwitchEnabled: LIVE_TRADING_MASTER_ENABLED,
+      mexcLiveKeyConfigured: !!(MEXC_LIVE_API_KEY && MEXC_LIVE_API_SECRET)
+    });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: state-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.get('/api/candle-live-trading/balance-preview', async (req, res) => {
+  if (!MEXC_LIVE_API_KEY || !MEXC_LIVE_API_SECRET) return res.status(400).json({ error: 'MEXC Live-Trading-Key ist serverseitig nicht konfiguriert.' });
+  try {
+    const balanceEur = await getMexcFuturesBalance();
+    res.json({ ok: true, balanceEur, fetchedAt: Date.now() });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: Guthaben-Vorschau fehlgeschlagen:', err);
+    res.status(502).json({ error: err.message || 'Guthaben-Abfrage fehlgeschlagen.' });
+  }
+});
+
+app.post('/api/candle-live-trading/enable', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
+  if (!req.body || req.body.confirmed !== true) return res.status(400).json({ error: 'Bestätigung fehlt (confirmed:true erforderlich).' });
+  if (!LIVE_TRADING_MASTER_ENABLED) return res.status(403).json({ error: 'Live-Trading ist serverseitig noch nicht freigegeben (Master-Schalter aus). Bitte zuerst gemeinsam mit dem Betreiber freigeben.' });
+  if (!MEXC_LIVE_API_KEY || !MEXC_LIVE_API_SECRET) return res.status(400).json({ error: 'MEXC Live-Trading-Key ist serverseitig nicht konfiguriert.' });
+  try {
+    const paperSettings = await getCandleSettings();
+    if (paperSettings.enabled) return res.status(409).json({ error: 'Paper-Trading für den Candlestick Bot ist noch aktiv. Bitte zuerst deaktivieren - Paper und Live können nicht gleichzeitig laufen.' });
+
+    let balanceEur;
+    try { balanceEur = await getMexcFuturesBalance(); } catch (err) {
+      return res.status(502).json({ error: `Guthaben-Abfrage fehlgeschlagen, Live-Trading wird NICHT aktiviert: ${err.message}` });
+    }
+
+    await pgPool.query('UPDATE candle_live_settings SET enabled = true, emergency_stop = false, last_balance_eur = $1, last_balance_at = now() WHERE id = 1', [balanceEur]);
+    await pgPool.query('INSERT INTO candle_live_balance_history (balance) VALUES ($1)', [balanceEur]);
+    await logCandleLive('info', 'live_trading_enabled', { balanceEur });
+    res.json({ ok: true, balanceEur });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: enable-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/candle-live-trading/disable', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
+  try {
+    await pgPool.query('UPDATE candle_live_settings SET enabled = false WHERE id = 1');
+    await logCandleLive('info', 'live_trading_disabled', {});
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: disable-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/candle-live-trading/emergency-stop', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
+  try {
+    const closeOpenPositions = !!(req.body && req.body.closeOpenPositions);
+    await pgPool.query('UPDATE candle_live_settings SET enabled = false, emergency_stop = true WHERE id = 1');
+    await logCandleLive('warn', 'emergency_stop', { closeOpenPositions });
+
+    const closedResults = [];
+    if (closeOpenPositions) {
+      const { rows: openRows } = await pgPool.query("SELECT * FROM candle_live_trades WHERE status = 'open'");
+      for (const row of openRows) {
+        const trade = candleLiveRowToTrade(row);
+        try {
+          await mexcClosePositionMarket(trade.symbol, trade.direction, trade.vol);
+          const exitPrice = candleLiveLastPrices[trade.symbol] ?? trade.entryPrice;
+          const pnlEur = trade.direction === 'long'
+            ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+            : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+          await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = 'EMERGENCY_STOP', pnl_eur = $2, closed_at = now() WHERE id = $3`, [exitPrice, pnlEur, trade.id]);
+          await logCandleLive('warn', 'emergency_close_success', { symbol: trade.symbol, tradeId: trade.id, pnlEur });
+          closedResults.push({ id: trade.id, symbol: trade.symbol, ok: true });
+        } catch (err) {
+          await logCandleLive('error', 'emergency_close_failed', { symbol: trade.symbol, tradeId: trade.id, error: err.message });
+          closedResults.push({ id: trade.id, symbol: trade.symbol, ok: false, error: err.message });
+        }
+      }
+    }
+    res.json({ ok: true, closedResults });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: emergency-stop-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
+app.post('/api/candle-live-trading/close/:id', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
+  try {
+    const { rows } = await pgPool.query("SELECT * FROM candle_live_trades WHERE id = $1 AND status = 'open'", [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'Offener Live-Trade nicht gefunden.' });
+    const trade = candleLiveRowToTrade(rows[0]);
+
+    try {
+      await mexcClosePositionMarket(trade.symbol, trade.direction, trade.vol);
+    } catch (err) {
+      await logCandleLive('error', 'manual_close_failed', { symbol: trade.symbol, tradeId: trade.id, error: err.message });
+      return res.status(502).json({ error: `Schließen bei MEXC fehlgeschlagen: ${err.message}` });
+    }
+
+    const exitPrice = candleLiveLastPrices[trade.symbol] ?? trade.entryPrice;
+    const pnlEur = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = 'MANUAL', pnl_eur = $2, closed_at = now() WHERE id = $3`, [exitPrice, pnlEur, trade.id]);
+    await logCandleLive('info', 'manual_close_success', { symbol: trade.symbol, tradeId: trade.id, pnlEur });
+    res.json({ ok: true, exitPrice, pnlEur });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: manuelles Schließen fehlgeschlagen:', err);
+    res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
+  }
+});
+
+app.post('/api/candle-live-trading/settings', async (req, res) => {
+  if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
+  try {
+    const incoming = req.body || {};
+    const current = await getCandleLiveSettings();
+    const next = {
+      leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 20 ? Math.round(Number(incoming.leverage)) : current.leverage,
+      slPct: Number(incoming.slPct) > 0 && Number(incoming.slPct) < 100 ? Number(incoming.slPct) : current.slPct,
+      tpPct: Number(incoming.tpPct) > 0 ? Number(incoming.tpPct) : current.tpPct
+    };
+    await pgPool.query('UPDATE candle_live_settings SET leverage = $1, sl_pct = $2, tp_pct = $3 WHERE id = 1', [next.leverage, next.slPct, next.tpPct]);
+    await logCandleLive('info', 'settings_updated', next);
+    res.json({ ok: true, settings: next });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: settings-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Datenbankfehler.' });
+  }
+});
+
 // Dynamische Nachkommastellen für Preis-Text (z.B. in Erkennungsgründen),
 // damit sehr günstige Coins (z.B. SHIB im Bereich 0,000005) nicht auf
 // "0.0000" gerundet werden.
@@ -3577,9 +4118,17 @@ initPdhPdlTradingSchema()
   })
   .catch(err => console.error('PDH/PDL Bot: Schema-Initialisierung fehlgeschlagen:', err));
 
+initCandleLiveTradingSchema()
+  .then(() => {
+    if (pgPool) console.log('Candlestick Bot LIVE: Datenbank-Schema bereit.');
+  })
+  .catch(err => console.error('Candlestick Bot LIVE: Schema-Initialisierung fehlgeschlagen:', err));
+
 app.listen(PORT, () => {
   console.log(`Jarvis-Server läuft auf http://localhost:${PORT}`);
   console.log(`Gemini konfiguriert: ${!!GEMINI_API_KEY} (Modell: ${GEMINI_MODEL})`);
   console.log(`MEXC konfiguriert: ${!!(MEXC_API_KEY && MEXC_API_SECRET)}`);
   console.log(`Datenbank (Auto Trader) konfiguriert: ${!!DATABASE_URL}`);
+  console.log(`MEXC Live-Trading-Key konfiguriert: ${!!(MEXC_LIVE_API_KEY && MEXC_LIVE_API_SECRET)}`);
+  console.log(`Live-Trading Master-Schalter: ${LIVE_TRADING_MASTER_ENABLED ? 'AN' : 'AUS (Live-Trading technisch blockiert)'}`);
 });
