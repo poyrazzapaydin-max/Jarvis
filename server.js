@@ -890,7 +890,7 @@ app.get('/api/paper-trading/state', async (req, res) => {
       checkedAt: new Date(r.checked_at).getTime()
     }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, insights, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PAPER_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, closedTradesAvgWin: closedStats.avgWin, closedTradesAvgLoss: closedStats.avgLoss, closedTradesMaxWin: closedStats.maxWin, closedTradesMaxLoss: closedStats.maxLoss, skippedSetups, insights, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PAPER_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('Paper-Trading: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -1387,7 +1387,7 @@ app.get('/api/ny-trading/state', async (req, res) => {
       id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime()
     }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: NY_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, closedTradesAvgWin: closedStats.avgWin, closedTradesAvgLoss: closedStats.avgLoss, closedTradesMaxWin: closedStats.maxWin, closedTradesMaxLoss: closedStats.maxLoss, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: NY_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('NY Range Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -1956,7 +1956,7 @@ app.get('/api/scalp-trading/state', async (req, res) => {
       failedCriteria: r.failed_criteria, note: r.note, checkedAt: new Date(r.checked_at).getTime()
     }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: SCALP_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, closedTradesAvgWin: closedStats.avgWin, closedTradesAvgLoss: closedStats.avgLoss, closedTradesMaxWin: closedStats.maxWin, closedTradesMaxLoss: closedStats.maxLoss, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: SCALP_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('Scalping Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -2293,7 +2293,7 @@ app.get('/api/fvg-trading/state', async (req, res) => {
     const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
     const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: FVG_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, closedTradesAvgWin: closedStats.avgWin, closedTradesAvgLoss: closedStats.avgLoss, closedTradesMaxWin: closedStats.maxWin, closedTradesMaxLoss: closedStats.maxLoss, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: FVG_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('FVG Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -2634,7 +2634,7 @@ app.get('/api/candle-trading/state', async (req, res) => {
     const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
     const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: CANDLE_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, closedTradesAvgWin: closedStats.avgWin, closedTradesAvgLoss: closedStats.avgLoss, closedTradesMaxWin: closedStats.maxWin, closedTradesMaxLoss: closedStats.maxLoss, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: CANDLE_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('Candlestick Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -2736,9 +2736,20 @@ async function checkLeverageChangeWarning(tradesTable, currentLeverage, newLever
 // eingefrorenen Anzeige führte (u.a. Scalping/FVG/Candlestick Bot).
 async function getClosedTradeStats(tradesTable) {
   const { rows } = await pgPool.query(
-    `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE pnl_eur > 0)::int AS wins FROM ${tradesTable} WHERE status = 'closed'`
+    `SELECT COUNT(*)::int AS total, COUNT(*) FILTER (WHERE pnl_eur > 0)::int AS wins,
+            AVG(pnl_eur) FILTER (WHERE pnl_eur > 0) AS avg_win,
+            AVG(pnl_eur) FILTER (WHERE pnl_eur <= 0) AS avg_loss,
+            MAX(pnl_eur) AS max_win, MIN(pnl_eur) AS max_loss
+     FROM ${tradesTable} WHERE status = 'closed'`
   );
-  return { total: rows[0].total, wins: rows[0].wins };
+  const r = rows[0];
+  return {
+    total: r.total, wins: r.wins,
+    avgWin: r.avg_win != null ? Number(r.avg_win) : null,
+    avgLoss: r.avg_loss != null ? Number(r.avg_loss) : null,
+    maxWin: r.max_win != null ? Number(r.max_win) : null,
+    maxLoss: r.max_loss != null ? Number(r.max_loss) : null
+  };
 }
 
 // Dynamische Nachkommastellen für Preis-Text (z.B. in Erkennungsgründen),
@@ -3019,7 +3030,7 @@ app.get('/api/vwap-trading/state', async (req, res) => {
     const balanceHistory = historyRows.map(r => ({ time: new Date(r.time).getTime(), balance: Number(r.balance) }));
     const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: VWAP_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, closedTradesAvgWin: closedStats.avgWin, closedTradesAvgLoss: closedStats.avgLoss, closedTradesMaxWin: closedStats.maxWin, closedTradesMaxLoss: closedStats.maxLoss, skippedSetups, lastCheck: settings.lastCheck, checkIntervalMs: VWAP_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('VWAP Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
@@ -3437,7 +3448,7 @@ app.get('/api/pdhpdl-trading/state', async (req, res) => {
     const skippedSetups = skippedRows.map(r => ({ id: r.id, symbol: r.symbol, direction: r.direction, reason: r.reason, createdAt: new Date(r.created_at).getTime() }));
     const checkLog = checkLogRows.map(r => ({ symbol: r.symbol, stage: r.stage, note: r.note, checkedAt: new Date(r.checked_at).getTime() }));
 
-    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PDHPDL_CHECK_INTERVAL_MS });
+    res.json({ settings, balanceEur: settings.balanceEur, balanceHistory, openTrades, closedTrades, closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins, closedTradesAvgWin: closedStats.avgWin, closedTradesAvgLoss: closedStats.avgLoss, closedTradesMaxWin: closedStats.maxWin, closedTradesMaxLoss: closedStats.maxLoss, skippedSetups, checkLog, lastCheck: settings.lastCheck, checkIntervalMs: PDHPDL_CHECK_INTERVAL_MS });
   } catch (err) {
     console.error('PDH/PDL Bot: state-Fehler:', err);
     res.status(500).json({ error: err.message || 'Datenbankfehler.' });
