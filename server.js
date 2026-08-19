@@ -2793,9 +2793,14 @@ const CANDLE_LIVE_DEFAULT_SETTINGS = {
   cooldownFilterEnabled: true, cooldownMinutes: 45
 };
 const MEXC_CONTRACT_HOST = 'https://contract.mexc.com';
-// MEXC Futures Taker-Gebühr (0,02%) - für Gebühren-Schätzungen im Filter (b)
-// und als Fallback, falls der echte Fee-Wert von MEXC mal nicht abrufbar ist.
-const MEXC_TAKER_FEE_RATE = 0.0002;
+// Echte, für dieses API-Konto per tiered_fee_rate/v2 verifizierte Taker-
+// Gebühr (0,08%) - NICHT die 0,02%, die vorher fälschlich angenommen wurden.
+// MEXC-Werbeaktionen für 0-Fee-Paare gelten laut offizieller Ankündigung nur
+// für Web/App-Trading, nicht für API-Trades. Für Gebühren-Schätzungen im
+// Filter (b) und als Fallback, falls der echte Fee-Wert von MEXC mal nicht
+// abrufbar ist.
+const MEXC_TAKER_FEE_RATE = 0.0008;
+const MEXC_MAKER_FEE_RATE = 0.0006;
 
 async function initCandleLiveTradingSchema() {
   if (!pgPool) return;
@@ -3034,6 +3039,28 @@ async function mexcPlaceOrder({ symbol, side, vol, leverage, stopLossPrice, take
   });
 }
 
+// Post-Only Limit-Order für den Einstieg (Maker-Gebühr statt Taker) - type=2.
+// MEXC lehnt Post-Only-Orders automatisch ab, falls sie sofort als Taker
+// ausgeführt würden (kein versehentliches Taker-Fill möglich).
+async function mexcPlacePostOnlyOrder({ symbol, side, vol, price, leverage, stopLossPrice, takeProfitPrice }) {
+  return mexcLiveRequest('POST', '/api/v1/private/order/create', {
+    symbol: toMexcFuturesSymbol(symbol), side, vol, price, leverage, openType: 1, type: 2, // 2 = Post Only
+    stopLossPrice, takeProfitPrice, positionMode: 2
+  });
+}
+
+async function mexcCancelOrder(orderId) {
+  return mexcLiveRequest('POST', '/api/v1/private/order/cancel', { orderIds: [Number(orderId)] });
+}
+
+// Status-Abfrage für eine einzelne Order (auch unfilled/pending, im
+// Gegensatz zur reinen History-Order-Liste) - für das Polling nach einer
+// Post-Only-Order, ob sie innerhalb des Zeitlimits gefüllt wurde.
+async function mexcGetOrderStatus(orderId) {
+  const data = await mexcLiveRequest('GET', `/api/v1/private/order/get/${orderId}`);
+  return data.data || null;
+}
+
 async function mexcClosePositionMarket(symbol, direction, vol) {
   // One-way: side 4 = close long, side 2 = close short
   const side = direction === 'long' ? 4 : 2;
@@ -3219,7 +3246,8 @@ async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
   // den Handelsvorteil nicht strukturell auffressen.
   if (settings.minProfitFeeFilterEnabled) {
     const expectedGrossProfitAtTp = marginPerSlot * (settings.tpPct / 100);
-    const estimatedRoundTripFees = marginPerSlot * settings.leverage * MEXC_TAKER_FEE_RATE * 2;
+    // Post-Only-Einstieg (Maker) + Ausstieg über natives SL/TP (Taker) - gemischter Satz.
+    const estimatedRoundTripFees = marginPerSlot * settings.leverage * (MEXC_MAKER_FEE_RATE + MEXC_TAKER_FEE_RATE);
     if (expectedGrossProfitAtTp < settings.minProfitFeeMultiple * estimatedRoundTripFees) {
       await logCandleLive('info', 'min_profit_fee_filter_rejected', { symbol, direction: setup.direction, expectedGrossProfitAtTp, estimatedRoundTripFees, minProfitFeeMultiple: settings.minProfitFeeMultiple });
       return;
@@ -3290,29 +3318,58 @@ async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
     return;
   }
 
+  // Post-Only Limit-Einstieg statt Market-Order: spart die Differenz zwischen
+  // Taker- (0,08%) und Maker-Gebühr (0,06%). Limit-Preis = Signalkerze-
+  // Schlusskurs, minimal in unsere Richtung verschoben (0,02%), auf den
+  // gültigen Preis-Tick gerundet. Kein Market-Fallback bei Nicht-Füllung -
+  // das würde die Gebühren-Ersparnis zunichtemachen (explizite Vorgabe).
+  const priceUnit = Number(contractDetail.priceUnit) || 0;
+  const limitOffsetPct = 0.0002;
+  let limitPrice = setup.direction === 'long' ? setup.entryPrice * (1 - limitOffsetPct) : setup.entryPrice * (1 + limitOffsetPct);
+  if (priceUnit > 0) limitPrice = Math.round(limitPrice / priceUnit) * priceUnit;
+
   let orderResult;
   try {
-    orderResult = await mexcPlaceOrder({ symbol, side, vol, leverage: settings.leverage, stopLossPrice: stopLoss, takeProfitPrice: takeProfit });
+    orderResult = await mexcPlacePostOnlyOrder({ symbol, side, vol, price: limitPrice, leverage: settings.leverage, stopLossPrice: stopLoss, takeProfitPrice: takeProfit });
   } catch (err) {
-    await logCandleLive('error', 'order_failed', { symbol, direction: setup.direction, vol, error: err.message });
+    await logCandleLive('error', 'post_only_order_failed', { symbol, direction: setup.direction, vol, limitPrice, error: err.message });
+    return;
+  }
+  const orderId = orderResult?.data?.orderId || null;
+  if (!orderId) {
+    await logCandleLive('error', 'post_only_order_no_id', { symbol, direction: setup.direction, limitPrice });
     return;
   }
 
-  const orderId = orderResult?.data?.orderId || null;
-  // Echte Entry-Gebühr über die Order-Historie abfragen (kurzer Retry, da die
-  // Order ggf. noch nicht sofort dort auftaucht) - Fallback: Schätzung anhand
-  // der MEXC-Taker-Gebühr, falls der Fill nicht rechtzeitig auffindbar ist.
-  let entryFeeEur = positionSizeEur * MEXC_TAKER_FEE_RATE;
-  if (orderId) {
-    const fill = await getMexcOrderFill(orderId);
-    if (fill) entryFeeEur = fill.fee;
+  // Bis zu ~18s auf Füllung warten (6 Versuche à 3s), danach stornieren und überspringen.
+  let filled = null;
+  for (let i = 0; i < 6; i++) {
+    await sleep(3000);
+    let status;
+    try { status = await mexcGetOrderStatus(orderId); } catch (err) { continue; }
+    if (status && Number(status.state) === 3) { filled = status; break; }
+    if (status && (Number(status.state) === 4 || Number(status.state) === 5)) {
+      // Vom Exchange selbst storniert/abgelehnt (z.B. Post-Only-Konflikt) - sofort abbrechen.
+      await logCandleLive('info', 'post_only_entry_rejected', { symbol, direction: setup.direction, orderId, limitPrice, state: status.state });
+      return;
+    }
   }
+
+  if (!filled) {
+    try { await mexcCancelOrder(orderId); } catch (err) { /* Order kann zwischenzeitlich selbst gefüllt/storniert worden sein */ }
+    await logCandleLive('info', 'post_only_entry_timeout', { symbol, direction: setup.direction, orderId, limitPrice });
+    return;
+  }
+
+  const actualEntryPrice = Number(filled.dealAvgPrice) || limitPrice;
+  const entryFeeEur = (Number(filled.takerFee) || 0) + (Number(filled.makerFee) || 0) || positionSizeEur * MEXC_TAKER_FEE_RATE;
+
   await pgPool.query(
     `INSERT INTO candle_live_trades (id, symbol, direction, entry_price, stop_loss, take_profit, pattern, signal_extreme, margin_eur, position_size_eur, leverage, vol, mexc_order_id, entry_fee_eur, reason, status, opened_at)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'open', now())`,
-    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, stopLoss, takeProfit, setup.pattern, setup.signalExtreme, marginPerSlot, positionSizeEur, settings.leverage, vol, orderId, entryFeeEur, reasonText]
+    [crypto.randomUUID(), symbol, setup.direction, actualEntryPrice, stopLoss, takeProfit, setup.pattern, setup.signalExtreme, marginPerSlot, positionSizeEur, settings.leverage, vol, orderId, entryFeeEur, reasonText]
   );
-  await logCandleLive('info', 'order_placed', { symbol, direction: setup.direction, vol, entryPrice: setup.entryPrice, stopLoss, takeProfit, orderId, entryFeeEur });
+  await logCandleLive('info', 'order_placed', { symbol, direction: setup.direction, vol, entryPrice: actualEntryPrice, limitPrice, stopLoss, takeProfit, orderId, entryFeeEur, orderType: 'post_only' });
 }
 
 async function runCandleLiveTradingCycle() {
