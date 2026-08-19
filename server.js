@@ -3538,6 +3538,37 @@ app.get('/api/candle-live-trading/audit-history', async (req, res) => {
   }
 });
 
+// Diagnose (nur lesend): tatsächliche, für dieses API-Konto geltende
+// Gebührensätze - MEXC-Werbeaktionen für 0-Fee-Paare gelten laut offizieller
+// Ankündigung NICHT für API-Trades, sondern nur für Web/App-Trading.
+app.get('/api/candle-live-trading/fee-rate', async (req, res) => {
+  if (!MEXC_LIVE_API_KEY || !MEXC_LIVE_API_SECRET) return res.status(400).json({ error: 'MEXC Live-Trading-Key ist serverseitig nicht konfiguriert.' });
+  try {
+    const symbolsParam = (req.query.symbols || '').split(',').map(s => s.trim()).filter(Boolean);
+    const symbols = symbolsParam.length ? symbolsParam : ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT', 'SUIUSDT', 'TAOUSDT'];
+    const results = [];
+    for (const symbol of symbols) {
+      try {
+        const data = await mexcLiveRequest('GET', '/api/v1/private/account/tiered_fee_rate/v2', { symbol: toMexcFuturesSymbol(symbol) });
+        const d = data.data || {};
+        results.push({
+          symbol, ok: true,
+          originalMakerFee: d.originalMakerFee, originalTakerFee: d.originalTakerFee,
+          realMakerFee: d.realMakerFee, realTakerFee: d.realTakerFee,
+          feeRateMode: d.feeRateMode, discountRate: d.discountRate, deductRate: d.deductRate
+        });
+      } catch (err) {
+        results.push({ symbol, ok: false, error: err.message });
+      }
+      await sleep(150);
+    }
+    res.json({ ok: true, results });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: Fee-Rate-Diagnose-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Fee-Rate-Abfrage fehlgeschlagen.' });
+  }
+});
+
 app.post('/api/candle-live-trading/enable', async (req, res) => {
   if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
   if (!req.body || req.body.confirmed !== true) return res.status(400).json({ error: 'Bestätigung fehlt (confirmed:true erforderlich).' });
