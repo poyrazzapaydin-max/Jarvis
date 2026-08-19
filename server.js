@@ -3347,6 +3347,47 @@ app.post('/api/candle-live-trading/dry-run-preview', async (req, res) => {
   }
 });
 
+// Diagnose-Endpunkt (nur lesend, keine Order): holt die echte MEXC-Order-
+// Historie inkl. Gebühren + realem PnL sowie Funding-Fee-Zahlungen für einen
+// Zeitraum, um Diskrepanzen zwischen lokal geloggtem Ergebnis und dem
+// tatsächlichen Guthabenverlauf aufzuklären.
+app.get('/api/candle-live-trading/audit-history', async (req, res) => {
+  if (!MEXC_LIVE_API_KEY || !MEXC_LIVE_API_SECRET) return res.status(400).json({ error: 'MEXC Live-Trading-Key ist serverseitig nicht konfiguriert.' });
+  try {
+    const startTime = req.query.startTime ? Number(req.query.startTime) : Date.now() - 24 * 60 * 60 * 1000;
+    const endTime = req.query.endTime ? Number(req.query.endTime) : Date.now();
+
+    const ordersData = await mexcLiveRequest('GET', '/api/v1/private/order/list/history_orders', {
+      start_time: startTime, end_time: endTime, page_num: 1, page_size: 100
+    });
+    const orders = Array.isArray(ordersData.data?.resultList) ? ordersData.data.resultList : (Array.isArray(ordersData.data) ? ordersData.data : []);
+
+    let fundingRecords = [];
+    try {
+      const fundingData = await mexcLiveRequest('GET', '/api/v1/private/position/funding_records', {
+        start_time: startTime, end_time: endTime, page_num: 1, page_size: 100
+      });
+      fundingRecords = Array.isArray(fundingData.data?.resultList) ? fundingData.data.resultList : (Array.isArray(fundingData.data) ? fundingData.data : []);
+    } catch (err) {
+      await logCandleLive('warn', 'audit_funding_fetch_failed', { error: err.message });
+    }
+
+    const totalRealizedProfit = orders.reduce((s, o) => s + (Number(o.profit) || 0), 0);
+    const totalFees = orders.reduce((s, o) => s + (Number(o.takerFee) || 0) + (Number(o.makerFee) || 0), 0);
+    const totalFunding = fundingRecords.reduce((s, f) => s + (Number(f.funding) || 0), 0);
+
+    res.json({
+      ok: true, startTime, endTime,
+      orders: orders.map(o => ({ symbol: o.symbol, side: o.side, state: o.state, profit: Number(o.profit) || 0, takerFee: Number(o.takerFee) || 0, makerFee: Number(o.makerFee) || 0, dealVol: o.dealVol, dealAvgPrice: o.dealAvgPrice, createTime: o.createTime })),
+      fundingRecords: fundingRecords.map(f => ({ symbol: f.symbol, funding: Number(f.funding) || 0, rate: f.rate, settleTime: f.settleTime, positionType: f.positionType })),
+      totals: { totalRealizedProfit, totalFees, totalFunding, netFromMexc: totalRealizedProfit - totalFees + totalFunding }
+    });
+  } catch (err) {
+    console.error('Candlestick Bot LIVE: Audit-Fehler:', err);
+    res.status(500).json({ error: err.message || 'Audit fehlgeschlagen.' });
+  }
+});
+
 app.post('/api/candle-live-trading/enable', async (req, res) => {
   if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
   if (!req.body || req.body.confirmed !== true) return res.status(400).json({ error: 'Bestätigung fehlt (confirmed:true erforderlich).' });
