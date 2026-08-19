@@ -2788,9 +2788,14 @@ async function getClosedTradeStats(tradesTable) {
 // ============================================================
 
 const CANDLE_LIVE_DEFAULT_SETTINGS = {
-  enabled: false, numSlots: 8, leverage: 10, slPct: 10, tpPct: 20, capitalSafetyPct: 90, maxSameDirectionPct: 60
+  enabled: false, numSlots: 8, leverage: 10, slPct: 10, tpPct: 20, capitalSafetyPct: 90, maxSameDirectionPct: 60,
+  htfTrendFilterEnabled: true, minProfitFeeFilterEnabled: true, minProfitFeeMultiple: 5,
+  cooldownFilterEnabled: true, cooldownMinutes: 45
 };
 const MEXC_CONTRACT_HOST = 'https://contract.mexc.com';
+// MEXC Futures Taker-Gebühr (0,02%) - für Gebühren-Schätzungen im Filter (b)
+// und als Fallback, falls der echte Fee-Wert von MEXC mal nicht abrufbar ist.
+const MEXC_TAKER_FEE_RATE = 0.0002;
 
 async function initCandleLiveTradingSchema() {
   if (!pgPool) return;
@@ -2812,6 +2817,13 @@ async function initCandleLiveTradingSchema() {
   // Nachträglich hinzugefügt (Richtungslimit) - ALTER statt CREATE, da die Tabelle
   // auf Render bereits existiert und live im Einsatz ist.
   await pgPool.query(`ALTER TABLE candle_live_settings ADD COLUMN IF NOT EXISTS max_same_direction_pct NUMERIC NOT NULL DEFAULT 60;`);
+  // Nachträglich hinzugefügt: Signalqualitäts-Filter gegen zu häufiges,
+  // gebührenfressendes Trading.
+  await pgPool.query(`ALTER TABLE candle_live_settings ADD COLUMN IF NOT EXISTS htf_trend_filter_enabled BOOLEAN NOT NULL DEFAULT true;`);
+  await pgPool.query(`ALTER TABLE candle_live_settings ADD COLUMN IF NOT EXISTS min_profit_fee_filter_enabled BOOLEAN NOT NULL DEFAULT true;`);
+  await pgPool.query(`ALTER TABLE candle_live_settings ADD COLUMN IF NOT EXISTS min_profit_fee_multiple NUMERIC NOT NULL DEFAULT 5;`);
+  await pgPool.query(`ALTER TABLE candle_live_settings ADD COLUMN IF NOT EXISTS cooldown_filter_enabled BOOLEAN NOT NULL DEFAULT true;`);
+  await pgPool.query(`ALTER TABLE candle_live_settings ADD COLUMN IF NOT EXISTS cooldown_minutes NUMERIC NOT NULL DEFAULT 45;`);
   // Einmalige Migrationen (nie wiederholt, nie rückgängig gemacht) - Tabelle
   // hält fest, welche einmaligen Datenkorrekturen bereits angewendet wurden.
   await pgPool.query(`CREATE TABLE IF NOT EXISTS candle_live_migrations (id TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now());`);
@@ -2841,6 +2853,10 @@ async function initCandleLiveTradingSchema() {
       closed_at TIMESTAMPTZ
     );
   `);
+  // Nachträglich hinzugefügt: echte MEXC-Gebühren pro Trade (Open + Close),
+  // damit pnl_eur die Gebühren korrekt mit einrechnet statt sie zu ignorieren.
+  await pgPool.query(`ALTER TABLE candle_live_trades ADD COLUMN IF NOT EXISTS entry_fee_eur NUMERIC;`);
+  await pgPool.query(`ALTER TABLE candle_live_trades ADD COLUMN IF NOT EXISTS exit_fee_eur NUMERIC;`);
   await pgPool.query(`
     CREATE TABLE IF NOT EXISTS candle_live_balance_history (
       id SERIAL PRIMARY KEY, time TIMESTAMPTZ NOT NULL DEFAULT now(), balance NUMERIC NOT NULL
@@ -2895,6 +2911,11 @@ function candleLiveRowToSettings(row) {
     enabled: row.enabled, numSlots: Number(row.num_slots), leverage: Number(row.leverage),
     slPct: Number(row.sl_pct), tpPct: Number(row.tp_pct), capitalSafetyPct: Number(row.capital_safety_pct),
     maxSameDirectionPct: Number(row.max_same_direction_pct),
+    htfTrendFilterEnabled: row.htf_trend_filter_enabled,
+    minProfitFeeFilterEnabled: row.min_profit_fee_filter_enabled,
+    minProfitFeeMultiple: Number(row.min_profit_fee_multiple),
+    cooldownFilterEnabled: row.cooldown_filter_enabled,
+    cooldownMinutes: Number(row.cooldown_minutes),
     lastCheck: row.last_check ? new Date(row.last_check).getTime() : null,
     lastBalanceEur: row.last_balance_eur != null ? Number(row.last_balance_eur) : null,
     lastBalanceAt: row.last_balance_at ? new Date(row.last_balance_at).getTime() : null,
@@ -2914,7 +2935,9 @@ function candleLiveRowToTrade(row) {
     vol: Number(row.vol), mexcOrderId: row.mexc_order_id, mexcPositionId: row.mexc_position_id,
     reason: row.reason, openedAt: new Date(row.opened_at).getTime(),
     exitPrice: row.exit_price != null ? Number(row.exit_price) : null, closeReason: row.close_reason,
-    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null, closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null
+    pnlEur: row.pnl_eur != null ? Number(row.pnl_eur) : null, closedAt: row.closed_at ? new Date(row.closed_at).getTime() : null,
+    entryFeeEur: row.entry_fee_eur != null ? Number(row.entry_fee_eur) : null,
+    exitFeeEur: row.exit_fee_eur != null ? Number(row.exit_fee_eur) : null
   };
 }
 
@@ -3024,6 +3047,57 @@ async function getMexcOpenPositions() {
   return Array.isArray(data.data) ? data.data : [];
 }
 
+function mexcHistoryOrdersList(data) {
+  return Array.isArray(data.data?.resultList) ? data.data.resultList : (Array.isArray(data.data) ? data.data : []);
+}
+
+// Holt den ECHTEN Fill (Preis + Gebühr + realisiertes PnL) einer Order über
+// ihre Order-ID - genutzt direkt nach einer selbst ausgelösten Order (Entry
+// oder manueller/Notfall-Close), damit pnl_eur/Gebühren auf echten MEXC-Daten
+// beruhen statt auf unserem eigenen theoretischen Preis. Kurzer Retry, weil
+// die Order ggf. noch nicht sofort in der History auftaucht.
+async function getMexcOrderFill(orderId, attempts = 4, delayMs = 1200) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const data = await mexcLiveRequest('GET', '/api/v1/private/order/list/history_orders', { orderId, page_num: 1, page_size: 1 });
+      const list = mexcHistoryOrdersList(data);
+      if (list.length && Number(list[0].state) === 3) {
+        const o = list[0];
+        return { fillPrice: Number(o.dealAvgPrice), profit: Number(o.profit) || 0, fee: (Number(o.takerFee) || 0) + (Number(o.makerFee) || 0) };
+      }
+    } catch (err) { /* nächster Versuch */ }
+    if (i < attempts - 1) await sleep(delayMs);
+  }
+  return null;
+}
+
+// Für Reconciliation: findet die jüngste CLOSE-seitige gefüllte Order für ein
+// Symbol seit einem Zeitpunkt (native SL/TP oder manuelle MEXC-Schließung -
+// wir kennen hier keine Order-ID, nur Symbol+Richtung+ungefähren Zeitraum).
+async function getMexcLatestCloseOrder(symbol, direction, sinceTimeMs) {
+  const closeSide = direction === 'long' ? 4 : 2;
+  try {
+    const data = await mexcLiveRequest('GET', '/api/v1/private/order/list/history_orders', {
+      symbol: toMexcFuturesSymbol(symbol), start_time: Math.max(0, sinceTimeMs - 5000), page_num: 1, page_size: 10
+    });
+    const list = mexcHistoryOrdersList(data);
+    const match = list.find(o => Number(o.side) === closeSide && Number(o.state) === 3);
+    if (!match) return null;
+    return { fillPrice: Number(match.dealAvgPrice), profit: Number(match.profit) || 0, fee: (Number(match.takerFee) || 0) + (Number(match.makerFee) || 0) };
+  } catch (err) {
+    return null;
+  }
+}
+
+// Einfacher EMA für den Höhere-Zeitrahmen-Trendfilter (2a).
+function computeEma(values, period) {
+  if (values.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = values.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (let i = period; i < values.length; i++) ema = values[i] * k + ema * (1 - k);
+  return ema;
+}
+
 // ---- Kapital-/Risikologik + Cycle ----
 const candleLiveLastPrices = {};
 
@@ -3054,20 +3128,37 @@ async function reconcileCandleLiveOpenPositions() {
     const stillOpen = openPositions.some(p => p.symbol === toMexcFuturesSymbol(trade.symbol) && Number(p.holdVol) > 0);
     if (stillOpen) continue;
 
-    let exitPrice = candleLiveLastPrices[trade.symbol];
-    let priceSource = 'cache';
-    if (exitPrice == null) {
-      try { exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol); priceSource = 'live_ticker'; }
-      catch (err) { exitPrice = trade.entryPrice; priceSource = 'fallback_entry_price'; }
+    // BUGFIX: nutzt zuerst den ECHTEN MEXC-Fill (Preis + Gebühr + realisiertes
+    // PnL) über die Order-Historie statt des Binance-Cache-/Ticker-Preises -
+    // der war nur eine Annäherung und wich vom tatsächlichen Ausführungspreis
+    // bei nativen SL/TP-Treffern ab, zusätzlich fehlten dabei die Gebühren
+    // komplett in pnl_eur.
+    const realFill = await getMexcLatestCloseOrder(trade.symbol, trade.direction, trade.openedAt);
+    let exitPrice, pnlEur, exitFeeEur, priceSource;
+    if (realFill) {
+      exitPrice = realFill.fillPrice;
+      exitFeeEur = realFill.fee;
+      pnlEur = realFill.profit - (trade.entryFeeEur || 0) - exitFeeEur;
+      priceSource = 'mexc_fill';
+    } else {
+      exitPrice = candleLiveLastPrices[trade.symbol];
+      priceSource = 'cache';
+      if (exitPrice == null) {
+        try { exitPrice = await fetchLiveTickerPriceWithRetry(trade.symbol); priceSource = 'live_ticker'; }
+        catch (err) { exitPrice = trade.entryPrice; priceSource = 'fallback_entry_price'; }
+      }
+      // Gebühren-Schätzung nur als Notlösung, wenn der echte Fill nicht auffindbar war.
+      exitFeeEur = trade.positionSizeEur * MEXC_TAKER_FEE_RATE;
+      const grossPnl = trade.direction === 'long'
+        ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+        : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+      pnlEur = grossPnl - (trade.entryFeeEur || 0) - exitFeeEur;
     }
     const closeReason = trade.direction === 'long'
       ? (exitPrice >= trade.takeProfit ? 'TP' : (exitPrice <= trade.stopLoss ? 'SL' : 'MANUAL_MEXC'))
       : (exitPrice <= trade.takeProfit ? 'TP' : (exitPrice >= trade.stopLoss ? 'SL' : 'MANUAL_MEXC'));
-    const pnlEur = trade.direction === 'long'
-      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
-      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
-    await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, closed_at = now() WHERE id = $4`, [exitPrice, closeReason, pnlEur, trade.id]);
-    await logCandleLive('info', 'position_closed_by_mexc', { symbol: trade.symbol, tradeId: trade.id, closeReason, pnlEur, priceSource });
+    await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, exit_fee_eur = $4, closed_at = now() WHERE id = $5`, [exitPrice, closeReason, pnlEur, exitFeeEur, trade.id]);
+    await logCandleLive('info', 'position_closed_by_mexc', { symbol: trade.symbol, tradeId: trade.id, closeReason, pnlEur, exitFeeEur, priceSource });
     closed++;
   }
   return { checked: openRows.length, closed };
@@ -3084,8 +3175,56 @@ async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
   const setup = detectCandleSetup(candles);
   if (!setup) return;
 
+  // Filter (c): Cooldown je Coin - verhindert schnelles Hin-und-Her-Traden
+  // desselben Coins kurz nacheinander (z.B. mehrere INJ/UNI-Trades in Folge).
+  if (settings.cooldownFilterEnabled) {
+    const { rows: lastTradeRows } = await pgPool.query(
+      "SELECT GREATEST(opened_at, COALESCE(closed_at, opened_at)) AS last_time FROM candle_live_trades WHERE symbol = $1 ORDER BY last_time DESC LIMIT 1", [symbol]
+    );
+    if (lastTradeRows.length) {
+      const elapsedMs = Date.now() - new Date(lastTradeRows[0].last_time).getTime();
+      const cooldownMs = settings.cooldownMinutes * 60 * 1000;
+      if (elapsedMs < cooldownMs) {
+        await logCandleLive('info', 'cooldown_active', { symbol, direction: setup.direction, elapsedMinutes: Number((elapsedMs / 60000).toFixed(1)), cooldownMinutes: settings.cooldownMinutes });
+        return;
+      }
+    }
+  }
+
+  // Filter (a): Höherer-Zeitrahmen-Trendfilter (15m EMA50) - nur Signale, die
+  // mit dem übergeordneten Trend übereinstimmen, werden gewertet. Reduziert
+  // die Trade-Anzahl auf die stärkeren, trendkonformen Setups.
+  if (settings.htfTrendFilterEnabled) {
+    try {
+      const htfCandles = await fetchPaperCandles(symbol, '15m', 60);
+      const htfCloses = htfCandles.map(c => c.close);
+      const ema50 = computeEma(htfCloses, 50);
+      const htfLast = htfCloses[htfCloses.length - 1];
+      const trendOk = ema50 != null && (setup.direction === 'long' ? htfLast > ema50 : htfLast < ema50);
+      if (!trendOk) {
+        await logCandleLive('info', 'htf_trend_filter_rejected', { symbol, direction: setup.direction, htfLast, ema50 });
+        return;
+      }
+    } catch (err) {
+      await logCandleLive('warn', 'htf_trend_filter_failed', { symbol, error: err.message });
+      return; // im Zweifel kein Trade, wenn der Trendfilter nicht auswertbar ist
+    }
+  }
+
   const usableCapital = freshBalanceEur * (settings.capitalSafetyPct / 100);
   const marginPerSlot = usableCapital / settings.numSlots;
+
+  // Filter (b): erwarteter Brutto-Gewinn bei TP muss mind. das X-fache der
+  // geschätzten Rundum-Gebühren (Ein+Ausstieg) betragen, damit die Gebühren
+  // den Handelsvorteil nicht strukturell auffressen.
+  if (settings.minProfitFeeFilterEnabled) {
+    const expectedGrossProfitAtTp = marginPerSlot * (settings.tpPct / 100);
+    const estimatedRoundTripFees = marginPerSlot * settings.leverage * MEXC_TAKER_FEE_RATE * 2;
+    if (expectedGrossProfitAtTp < settings.minProfitFeeMultiple * estimatedRoundTripFees) {
+      await logCandleLive('info', 'min_profit_fee_filter_rejected', { symbol, direction: setup.direction, expectedGrossProfitAtTp, estimatedRoundTripFees, minProfitFeeMultiple: settings.minProfitFeeMultiple });
+      return;
+    }
+  }
 
   const { rows: usedRows } = await pgPool.query("SELECT COALESCE(SUM(margin_eur), 0) AS used FROM candle_live_trades WHERE status = 'open'");
   const usedMarginEur = Number(usedRows[0].used);
@@ -3160,12 +3299,20 @@ async function checkCandleLiveSymbol(symbol, settings, freshBalanceEur) {
   }
 
   const orderId = orderResult?.data?.orderId || null;
+  // Echte Entry-Gebühr über die Order-Historie abfragen (kurzer Retry, da die
+  // Order ggf. noch nicht sofort dort auftaucht) - Fallback: Schätzung anhand
+  // der MEXC-Taker-Gebühr, falls der Fill nicht rechtzeitig auffindbar ist.
+  let entryFeeEur = positionSizeEur * MEXC_TAKER_FEE_RATE;
+  if (orderId) {
+    const fill = await getMexcOrderFill(orderId);
+    if (fill) entryFeeEur = fill.fee;
+  }
   await pgPool.query(
-    `INSERT INTO candle_live_trades (id, symbol, direction, entry_price, stop_loss, take_profit, pattern, signal_extreme, margin_eur, position_size_eur, leverage, vol, mexc_order_id, reason, status, opened_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'open', now())`,
-    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, stopLoss, takeProfit, setup.pattern, setup.signalExtreme, marginPerSlot, positionSizeEur, settings.leverage, vol, orderId, reasonText]
+    `INSERT INTO candle_live_trades (id, symbol, direction, entry_price, stop_loss, take_profit, pattern, signal_extreme, margin_eur, position_size_eur, leverage, vol, mexc_order_id, entry_fee_eur, reason, status, opened_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'open', now())`,
+    [crypto.randomUUID(), symbol, setup.direction, setup.entryPrice, stopLoss, takeProfit, setup.pattern, setup.signalExtreme, marginPerSlot, positionSizeEur, settings.leverage, vol, orderId, entryFeeEur, reasonText]
   );
-  await logCandleLive('info', 'order_placed', { symbol, direction: setup.direction, vol, entryPrice: setup.entryPrice, stopLoss, takeProfit, orderId });
+  await logCandleLive('info', 'order_placed', { symbol, direction: setup.direction, vol, entryPrice: setup.entryPrice, stopLoss, takeProfit, orderId, entryFeeEur });
 }
 
 async function runCandleLiveTradingCycle() {
@@ -3225,6 +3372,8 @@ app.get('/api/candle-live-trading/state', async (req, res) => {
     const { rows: historyRows } = await pgPool.query('SELECT time, balance FROM candle_live_balance_history ORDER BY time ASC');
     const { rows: logRows } = await pgPool.query('SELECT * FROM candle_live_log ORDER BY time DESC LIMIT 100');
     const closedStats = await getClosedTradeStats('candle_live_trades');
+    const { rows: feeRows } = await pgPool.query("SELECT COALESCE(SUM(entry_fee_eur), 0) + COALESCE(SUM(exit_fee_eur), 0) AS total FROM candle_live_trades WHERE status = 'closed'");
+    const closedTradesTotalFees = Number(feeRows[0].total);
 
     const openTrades = openRows.map(candleLiveRowToTrade).map(t => {
       const currentPrice = candleLiveLastPrices[t.symbol] ?? null;
@@ -3245,6 +3394,7 @@ app.get('/api/candle-live-trading/state', async (req, res) => {
       closedTradesTotal: closedStats.total, closedTradesWins: closedStats.wins,
       closedTradesAvgWin: closedStats.avgWin, closedTradesAvgLoss: closedStats.avgLoss,
       closedTradesMaxWin: closedStats.maxWin, closedTradesMaxLoss: closedStats.maxLoss,
+      closedTradesTotalFees,
       log, lastCheck: settings.lastCheck, checkIntervalMs: CANDLE_LIVE_CHECK_INTERVAL_MS,
       masterSwitchEnabled: LIVE_TRADING_MASTER_ENABLED,
       mexcLiveKeyConfigured: !!(MEXC_LIVE_API_KEY && MEXC_LIVE_API_SECRET)
@@ -3424,6 +3574,35 @@ app.post('/api/candle-live-trading/disable', async (req, res) => {
   }
 });
 
+// Gemeinsame Logik für selbst ausgelöste Closes (manuell / Notfall-Stopp):
+// löst die Market-Order aus, holt danach den ECHTEN Fill über die Order-ID
+// (Preis + Gebühr + realisiertes PnL), fällt nur bei Nichtauffindbarkeit auf
+// Cache-Preis + Gebühren-Schätzung zurück.
+async function closeCandleLiveTradeOnMexc(trade, closeReasonLabel) {
+  const orderResult = await mexcClosePositionMarket(trade.symbol, trade.direction, trade.vol);
+  const orderId = orderResult?.data?.orderId || null;
+  const realFill = orderId ? await getMexcOrderFill(orderId) : null;
+
+  let exitPrice, pnlEur, exitFeeEur, priceSource;
+  if (realFill) {
+    exitPrice = realFill.fillPrice;
+    exitFeeEur = realFill.fee;
+    pnlEur = realFill.profit - (trade.entryFeeEur || 0) - exitFeeEur;
+    priceSource = 'mexc_fill';
+  } else {
+    exitPrice = candleLiveLastPrices[trade.symbol] ?? trade.entryPrice;
+    priceSource = candleLiveLastPrices[trade.symbol] != null ? 'cache' : 'fallback_entry_price';
+    exitFeeEur = trade.positionSizeEur * MEXC_TAKER_FEE_RATE;
+    const grossPnl = trade.direction === 'long'
+      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
+      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
+    pnlEur = grossPnl - (trade.entryFeeEur || 0) - exitFeeEur;
+  }
+
+  await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = $2, pnl_eur = $3, exit_fee_eur = $4, closed_at = now() WHERE id = $5`, [exitPrice, closeReasonLabel, pnlEur, exitFeeEur, trade.id]);
+  return { exitPrice, pnlEur, exitFeeEur, priceSource, orderId };
+}
+
 app.post('/api/candle-live-trading/emergency-stop', async (req, res) => {
   if (!pgPool) return res.status(400).json({ error: 'DATABASE_URL ist serverseitig nicht konfiguriert.' });
   try {
@@ -3437,14 +3616,9 @@ app.post('/api/candle-live-trading/emergency-stop', async (req, res) => {
       for (const row of openRows) {
         const trade = candleLiveRowToTrade(row);
         try {
-          await mexcClosePositionMarket(trade.symbol, trade.direction, trade.vol);
-          const exitPrice = candleLiveLastPrices[trade.symbol] ?? trade.entryPrice;
-          const pnlEur = trade.direction === 'long'
-            ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
-            : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
-          await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = 'EMERGENCY_STOP', pnl_eur = $2, closed_at = now() WHERE id = $3`, [exitPrice, pnlEur, trade.id]);
-          await logCandleLive('warn', 'emergency_close_success', { symbol: trade.symbol, tradeId: trade.id, pnlEur });
-          closedResults.push({ id: trade.id, symbol: trade.symbol, ok: true });
+          const result = await closeCandleLiveTradeOnMexc(trade, 'EMERGENCY_STOP');
+          await logCandleLive('warn', 'emergency_close_success', { symbol: trade.symbol, tradeId: trade.id, ...result });
+          closedResults.push({ id: trade.id, symbol: trade.symbol, ok: true, ...result });
         } catch (err) {
           await logCandleLive('error', 'emergency_close_failed', { symbol: trade.symbol, tradeId: trade.id, error: err.message });
           closedResults.push({ id: trade.id, symbol: trade.symbol, ok: false, error: err.message });
@@ -3465,20 +3639,16 @@ app.post('/api/candle-live-trading/close/:id', async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: 'Offener Live-Trade nicht gefunden.' });
     const trade = candleLiveRowToTrade(rows[0]);
 
+    let result;
     try {
-      await mexcClosePositionMarket(trade.symbol, trade.direction, trade.vol);
+      result = await closeCandleLiveTradeOnMexc(trade, 'MANUAL');
     } catch (err) {
       await logCandleLive('error', 'manual_close_failed', { symbol: trade.symbol, tradeId: trade.id, error: err.message });
       return res.status(502).json({ error: `Schließen bei MEXC fehlgeschlagen: ${err.message}` });
     }
 
-    const exitPrice = candleLiveLastPrices[trade.symbol] ?? trade.entryPrice;
-    const pnlEur = trade.direction === 'long'
-      ? (exitPrice - trade.entryPrice) / trade.entryPrice * trade.positionSizeEur
-      : (trade.entryPrice - exitPrice) / trade.entryPrice * trade.positionSizeEur;
-    await pgPool.query(`UPDATE candle_live_trades SET status = 'closed', exit_price = $1, close_reason = 'MANUAL', pnl_eur = $2, closed_at = now() WHERE id = $3`, [exitPrice, pnlEur, trade.id]);
-    await logCandleLive('info', 'manual_close_success', { symbol: trade.symbol, tradeId: trade.id, pnlEur });
-    res.json({ ok: true, exitPrice, pnlEur });
+    await logCandleLive('info', 'manual_close_success', { symbol: trade.symbol, tradeId: trade.id, ...result });
+    res.json({ ok: true, ...result });
   } catch (err) {
     console.error('Candlestick Bot LIVE: manuelles Schließen fehlgeschlagen:', err);
     res.status(500).json({ error: err.message || 'Fehler beim Schließen.' });
@@ -3494,9 +3664,19 @@ app.post('/api/candle-live-trading/settings', async (req, res) => {
       leverage: Number(incoming.leverage) >= 1 && Number(incoming.leverage) <= 20 ? Math.round(Number(incoming.leverage)) : current.leverage,
       slPct: Number(incoming.slPct) > 0 && Number(incoming.slPct) < 100 ? Number(incoming.slPct) : current.slPct,
       tpPct: Number(incoming.tpPct) > 0 ? Number(incoming.tpPct) : current.tpPct,
-      maxSameDirectionPct: Number(incoming.maxSameDirectionPct) >= 50 && Number(incoming.maxSameDirectionPct) <= 100 ? Number(incoming.maxSameDirectionPct) : current.maxSameDirectionPct
+      maxSameDirectionPct: Number(incoming.maxSameDirectionPct) >= 50 && Number(incoming.maxSameDirectionPct) <= 100 ? Number(incoming.maxSameDirectionPct) : current.maxSameDirectionPct,
+      htfTrendFilterEnabled: incoming.htfTrendFilterEnabled != null ? !!incoming.htfTrendFilterEnabled : current.htfTrendFilterEnabled,
+      minProfitFeeFilterEnabled: incoming.minProfitFeeFilterEnabled != null ? !!incoming.minProfitFeeFilterEnabled : current.minProfitFeeFilterEnabled,
+      minProfitFeeMultiple: Number(incoming.minProfitFeeMultiple) >= 1 ? Number(incoming.minProfitFeeMultiple) : current.minProfitFeeMultiple,
+      cooldownFilterEnabled: incoming.cooldownFilterEnabled != null ? !!incoming.cooldownFilterEnabled : current.cooldownFilterEnabled,
+      cooldownMinutes: Number(incoming.cooldownMinutes) >= 0 ? Number(incoming.cooldownMinutes) : current.cooldownMinutes
     };
-    await pgPool.query('UPDATE candle_live_settings SET leverage = $1, sl_pct = $2, tp_pct = $3, max_same_direction_pct = $4 WHERE id = 1', [next.leverage, next.slPct, next.tpPct, next.maxSameDirectionPct]);
+    await pgPool.query(
+      `UPDATE candle_live_settings SET leverage = $1, sl_pct = $2, tp_pct = $3, max_same_direction_pct = $4,
+       htf_trend_filter_enabled = $5, min_profit_fee_filter_enabled = $6, min_profit_fee_multiple = $7,
+       cooldown_filter_enabled = $8, cooldown_minutes = $9 WHERE id = 1`,
+      [next.leverage, next.slPct, next.tpPct, next.maxSameDirectionPct, next.htfTrendFilterEnabled, next.minProfitFeeFilterEnabled, next.minProfitFeeMultiple, next.cooldownFilterEnabled, next.cooldownMinutes]
+    );
     await logCandleLive('info', 'settings_updated', next);
     res.json({ ok: true, settings: next });
   } catch (err) {

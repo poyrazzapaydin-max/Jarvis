@@ -3115,6 +3115,25 @@
     border-color: rgba(255,61,61,0.18) !important;
   }
 
+  .live-filter-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 14px;
+    margin-top: 10px;
+  }
+  .live-filter-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.72rem;
+    color: #aab2c0;
+  }
+  .live-filter-toggle input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: #ff3d3d;
+  }
+
   .live-save-btn {
     background: linear-gradient(135deg, #ff3d3d, #ff7a3d) !important;
   }
@@ -4250,6 +4269,7 @@
               <div class="live-balance-meta mono" id="candleLiveBalanceMeta">Noch nicht abgerufen.</div>
             </div>
             <div class="stat-box live-stat-box"><div class="stat-label">LIVE-ERGEBNIS</div><div class="stat-value mono" id="candleLiveTotalResult">--</div></div>
+            <div class="stat-box live-stat-box"><div class="stat-label">GEBÜHREN GESAMT (LIVE)</div><div class="stat-value mono" id="candleLiveTotalFees">--</div></div>
             <div class="stat-box live-stat-box"><div class="stat-label">TRADES GESAMT (LIVE)</div><div class="stat-value mono" id="candleLiveTradeCount">--</div></div>
             <div class="stat-box live-stat-box"><div class="stat-label">GEWINNRATE (LIVE)</div><div class="stat-value mono" id="candleLiveWinRate">--</div></div>
           </div>
@@ -4261,6 +4281,14 @@
               <label>Stop-Loss (%)<input type="number" step="0.5" min="0.5" max="90" class="select-input" id="candleLiveSlPct"></label>
               <label>Take-Profit (%)<input type="number" step="0.5" min="0.5" class="select-input" id="candleLiveTpPct"></label>
               <label>Max. gleiche Richtung (%)<input type="number" step="5" min="50" max="100" class="select-input" id="candleLiveMaxSameDirectionPct"></label>
+            </div>
+            <div class="panel-title" style="margin-top:14px;">SIGNALQUALITÄTS-FILTER <span class="card-title-hint">— weniger, aber hochwertigere Trades gegen Gebühren-Auffressung</span></div>
+            <div class="live-filter-row">
+              <label class="live-filter-toggle"><input type="checkbox" id="candleLiveHtfFilterEnabled"> Höherer-Zeitrahmen-Trendfilter (15m EMA50)</label>
+              <label class="live-filter-toggle"><input type="checkbox" id="candleLiveMinProfitFeeFilterEnabled"> Mindest-Gewinn-vs-Gebühren-Filter</label>
+              <label>Faktor (min. X-facher Gebühr)<input type="number" step="1" min="1" class="select-input" id="candleLiveMinProfitFeeMultiple"></label>
+              <label class="live-filter-toggle"><input type="checkbox" id="candleLiveCooldownFilterEnabled"> Cooldown je Coin</label>
+              <label>Cooldown (Minuten)<input type="number" step="5" min="0" class="select-input" id="candleLiveCooldownMinutes"></label>
             </div>
             <div class="quick-action-row" style="margin-top:14px;">
               <button class="big-analyze-btn live-save-btn" id="candleLiveSaveSettingsBtn" style="padding:11px 24px; font-size:0.8rem;">Live-Einstellungen speichern</button>
@@ -9530,6 +9558,11 @@
       document.getElementById('candleLiveSlPct').value = data.settings.slPct;
       document.getElementById('candleLiveTpPct').value = data.settings.tpPct;
       document.getElementById('candleLiveMaxSameDirectionPct').value = data.settings.maxSameDirectionPct;
+      document.getElementById('candleLiveHtfFilterEnabled').checked = !!data.settings.htfTrendFilterEnabled;
+      document.getElementById('candleLiveMinProfitFeeFilterEnabled').checked = !!data.settings.minProfitFeeFilterEnabled;
+      document.getElementById('candleLiveMinProfitFeeMultiple').value = data.settings.minProfitFeeMultiple;
+      document.getElementById('candleLiveCooldownFilterEnabled').checked = !!data.settings.cooldownFilterEnabled;
+      document.getElementById('candleLiveCooldownMinutes').value = data.settings.cooldownMinutes;
 
       const toggleBtn = document.getElementById('candleLiveEnableToggle');
       toggleBtn.classList.toggle('on', data.settings.enabled);
@@ -9554,8 +9587,11 @@
 
       const realizedResult = closed.reduce((sum, t) => sum + (t.pnlEur || 0), 0);
       const resultEl = document.getElementById('candleLiveTotalResult');
-      resultEl.textContent = `${realizedResult >= 0 ? '+' : ''}${realizedResult.toFixed(2)}€ (realisiert)`;
+      resultEl.textContent = `${realizedResult >= 0 ? '+' : ''}${realizedResult.toFixed(2)}€ (realisiert, netto inkl. Gebühren)`;
       resultEl.className = 'stat-value mono ' + (realizedResult >= 0 ? 'up' : 'down');
+
+      const feesEl = document.getElementById('candleLiveTotalFees');
+      if (feesEl) feesEl.textContent = data.closedTradesTotalFees != null ? `-${data.closedTradesTotalFees.toFixed(2)}€` : '--';
 
       candleDrawBalanceChart(data.balanceHistory, 'candleLiveBalanceChart', 'candleLiveChartPlaceholder');
 
@@ -9609,7 +9645,12 @@
       leverage: parseInt(document.getElementById('candleLiveLeverage').value, 10),
       slPct: parseFloat(document.getElementById('candleLiveSlPct').value),
       tpPct: parseFloat(document.getElementById('candleLiveTpPct').value),
-      maxSameDirectionPct: parseFloat(document.getElementById('candleLiveMaxSameDirectionPct').value)
+      maxSameDirectionPct: parseFloat(document.getElementById('candleLiveMaxSameDirectionPct').value),
+      htfTrendFilterEnabled: document.getElementById('candleLiveHtfFilterEnabled').checked,
+      minProfitFeeFilterEnabled: document.getElementById('candleLiveMinProfitFeeFilterEnabled').checked,
+      minProfitFeeMultiple: parseFloat(document.getElementById('candleLiveMinProfitFeeMultiple').value),
+      cooldownFilterEnabled: document.getElementById('candleLiveCooldownFilterEnabled').checked,
+      cooldownMinutes: parseFloat(document.getElementById('candleLiveCooldownMinutes').value)
     };
     await fetch('/api/candle-live-trading/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     addFeedEntry('Candlestick-Bot LIVE-Einstellungen gespeichert');
